@@ -27,16 +27,26 @@ pub fn cache_key(
     questions: &BTreeMap<String, Question>,
 ) -> String {
     let mut h = Sha256::new();
-    h.update(judge.as_bytes());
-    h.update([0]);
-    h.update(version.to_le_bytes());
-    h.update([0]);
-    h.update(model.as_bytes());
-    h.update([0]);
-    h.update(serde_json::to_vec(state).unwrap_or_default());
-    h.update([0]);
-    h.update(serde_json::to_vec(questions).unwrap_or_default());
+    feed(&mut h, judge.as_bytes());
+    h.update(version.to_le_bytes()); // fixed width, needs no framing
+    feed(&mut h, model.as_bytes());
+    feed(&mut h, &serde_json::to_vec(state).unwrap_or_default());
+    feed(&mut h, &serde_json::to_vec(questions).unwrap_or_default());
     format!("{:x}", h.finalize())
+}
+
+/// Hash one variable-length field prefixed by its length, so field
+/// boundaries are unambiguous and no two different inputs can produce the
+/// same byte stream. A single-byte delimiter would be weaker: a field
+/// whose content includes that byte could realign the stream. `model`
+/// comes from user TOML and is not under this code's control.
+///
+/// This costs nothing now and cannot be changed cheaply later: the cache
+/// is meant to be committed to git, so altering the hash input format
+/// invalidates every entry anyone has already committed.
+fn feed(h: &mut Sha256, bytes: &[u8]) {
+    h.update((bytes.len() as u64).to_le_bytes());
+    h.update(bytes);
 }
 
 pub struct Cache {
@@ -127,6 +137,9 @@ mod tests {
     fn key_changes_when_any_input_changes() {
         let s = json!({ "name": "helper" });
         let base = cache_key("dead_code", 1, "jev-latest", &s, &questions());
+        // A different judge must never collide with this one. Two judges
+        // sharing a key would serve one judge's verdict to the other.
+        assert_ne!(base, cache_key("duplication", 1, "jev-latest", &s, &questions()));
         assert_ne!(base, cache_key("dead_code", 2, "jev-latest", &s, &questions()));
         assert_ne!(base, cache_key("dead_code", 1, "jev-1.13.0", &s, &questions()));
         assert_ne!(

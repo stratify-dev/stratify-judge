@@ -82,11 +82,20 @@ mod tests {
     }
 
     fn judgment(v: Verdict) -> Judgment {
+        // Non-empty answers on purpose: these raw probabilities are the
+        // product's auditability guarantee, so a test that always passes
+        // an empty map never exercises the field that carries them.
+        let mut answers = serde_json::Map::new();
+        answers.insert("framework_invoked".into(), serde_json::json!(0.91));
+        answers.insert(
+            "explanation".into(),
+            serde_json::json!({ "choice": "framework_invoked", "confidence": 0.88 }),
+        );
         Judgment {
             judge: "dead_code".into(),
             verdict: v,
             reason: "reached by a framework".into(),
-            answers: serde_json::Map::new(),
+            answers,
             model: "jev-1.13.0".into(),
         }
     }
@@ -140,5 +149,31 @@ mod tests {
         assert_eq!(f.extra["judgment"]["original"]["confidence"], "certain");
         assert_eq!(f.extra["judgment"]["reason"], "reached by a framework");
         assert_eq!(f.extra["judgment"]["model"], "jev-1.13.0");
+    }
+
+    #[test]
+    fn every_raw_probability_reaches_the_finding() {
+        let mut f = finding(Severity::Info, Confidence::Likely);
+        apply(&mut f, &judgment(Verdict::Dismiss), Severity::Warning);
+        let answers = &f.extra["judgment"]["answers"];
+        assert_eq!(answers["framework_invoked"], 0.91);
+        assert_eq!(answers["explanation"]["choice"], "framework_invoked");
+    }
+
+    #[test]
+    fn step_down_walks_every_severity_tier() {
+        // Weaken's behavior rests entirely on this, and the Warning tier is
+        // the common case: duplication findings are reported at Warning.
+        assert_eq!(Severity::Error.step_down(), Severity::Warning);
+        assert_eq!(Severity::Warning.step_down(), Severity::Info);
+        assert_eq!(Severity::Info.step_down(), Severity::Info);
+    }
+
+    #[test]
+    fn weaken_moves_a_warning_finding_to_info() {
+        let mut f = finding(Severity::Warning, Confidence::Certain);
+        apply(&mut f, &judgment(Verdict::Weaken), Severity::Warning);
+        assert_eq!(f.severity, Severity::Info);
+        assert_eq!(f.confidence, Confidence::Likely);
     }
 }
