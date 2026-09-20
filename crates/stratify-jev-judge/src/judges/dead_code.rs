@@ -50,6 +50,39 @@ fn attributes_above(ctx: &RepoContext, file: &str, start_line: usize) -> Vec<Str
     out
 }
 
+/// Where else this function's name appears, excluding its own declaration
+/// line. Split in-file from repo-wide because they answer different
+/// questions: in-file occurrences catch a private helper whose only caller
+/// was itself unreachable, repo-wide ones catch a call the engine could not
+/// resolve across a crate boundary.
+///
+/// Sample lines are capped so a common name cannot blow past the state
+/// budget. Name collisions make this a hint, never a proof, and the
+/// question wording says so.
+fn occurrence_summary(
+    ctx: &RepoContext,
+    decl: &crate::model::Span,
+    name: &str,
+) -> serde_json::Value {
+    const MAX_SAMPLES: usize = 8;
+    let all = ctx.occurrences(name);
+    let elsewhere: Vec<_> = all
+        .into_iter()
+        .filter(|o| !(o.file == decl.file && o.line == decl.start_line))
+        .collect();
+    let in_file = elsewhere.iter().filter(|o| o.file == decl.file).count();
+    let samples: Vec<String> = elsewhere
+        .iter()
+        .take(MAX_SAMPLES)
+        .map(|o| format!("{}:{}: {}", o.file, o.line, o.text))
+        .collect();
+    serde_json::json!({
+        "in_this_file": in_file,
+        "repo_wide": elsewhere.len(),
+        "sample_sites": samples,
+    })
+}
+
 /// Import-looking lines from the head of the file, capped so state stays small.
 fn imports_of(ctx: &RepoContext, file: &str) -> Vec<String> {
     let Some(text) = ctx.file_text(file) else {
@@ -77,6 +110,19 @@ fn project_markers(ctx: &RepoContext) -> Vec<String> {
     if let Ok(t) = std::fs::read_to_string(root.join("Cargo.toml")) {
         if t.contains("publish = false") {
             out.push("Cargo.toml declares publish = false".into());
+        }
+        // `publish = false` almost never appears in a workspace, because
+        // unpublished members simply omit the key. Without this marker the
+        // external_api question points at an empty array on exactly the
+        // repos where it matters most, and a `pub` item crossing a crate
+        // boundary inside the repo looks like a public API.
+        if t.contains("[workspace]") {
+            let members = t.matches("crates/").count().max(1);
+            out.push(format!(
+                "Cargo workspace with roughly {members} member crates: `pub` items \
+                 are called across crates inside this repository, not only by \
+                 outside consumers"
+            ));
         }
     }
     if let Ok(t) = std::fs::read_to_string(root.join("package.json")) {
@@ -111,6 +157,9 @@ impl DeadCodeJudge {
         let fw = answers.get("framework_invoked").and_then(Answer::as_noul);
         let test = answers.get("test_only").and_then(Answer::as_noul);
         let api = answers.get("external_api").and_then(Answer::as_noul);
+        let resolver = answers
+            .get("resolver_missed_a_call")
+            .and_then(Answer::as_noul);
         let explanation = answers.get("explanation").and_then(Answer::as_choice);
 
         let mut raw = serde_json::Map::new();
@@ -123,6 +172,9 @@ impl DeadCodeJudge {
         if let Some(v) = api {
             raw.insert("external_api".into(), serde_json::json!(v));
         }
+        if let Some(v) = resolver {
+            raw.insert("resolver_missed_a_call".into(), serde_json::json!(v));
+        }
         if let Some((pick, conf)) = explanation {
             raw.insert(
                 "explanation".into(),
@@ -134,6 +186,7 @@ impl DeadCodeJudge {
             fw,
             test,
             api,
+            resolver,
             explanation,
             (finding.severity, finding.confidence),
             cfg,
@@ -160,6 +213,7 @@ fn decide(
     fw: Option<f64>,
     test: Option<f64>,
     api: Option<f64>,
+    resolver: Option<f64>,
     explanation: Option<(&str, f64)>,
     engine: (Severity, Confidence),
     cfg: &DeadCodeThresholds,
@@ -168,6 +222,18 @@ fn decide(
     let (Some(fw), Some(test), Some(api)) = (fw, test, api) else {
         return (Verdict::Keep, "no usable answer, left as the engine found it".into());
     };
+    // An absent resolver answer is unknown, not low and not high. It must
+    // not trigger Dismiss, or a model that omits the answer would dismiss
+    // every finding. It must not permit Strengthen either, since a cache
+    // entry predating this question carries no resolver evidence at all.
+    if let Some(r) = resolver {
+        if r >= cfg.resolver_at {
+            return (
+                Verdict::Dismiss,
+                format!("a call site exists that the engine could not resolve ({r:.2})"),
+            );
+        }
+    }
 
     if fw >= cfg.dismiss_at {
         return (Verdict::Dismiss, format!("reached by a framework ({fw:.2})"));
@@ -201,7 +267,19 @@ fn decide(
             )
         };
     }
-    if fw < cfg.low_at && test < cfg.low_at && api < cfg.low_at {
+    if let Some(("resolver_limitation", conf)) = explanation {
+        if conf >= cfg.explanation_at {
+            return (
+                Verdict::Dismiss,
+                format!("the analyzer missed a real call rather than finding dead code ({conf:.2})"),
+            );
+        }
+    }
+    if fw < cfg.low_at
+        && test < cfg.low_at
+        && api < cfg.low_at
+        && resolver.is_some_and(|r| r < cfg.low_at)
+    {
         if let Some(("genuinely_unused", conf)) = explanation {
             if conf >= cfg.explanation_at {
                 // The guard that holds even when every question fails.
@@ -236,7 +314,11 @@ impl Judge for DeadCodeJudge {
     }
 
     fn version(&self) -> u32 {
-        1
+        // 2: state gained occurrences, in_test_context and engine_confidence,
+        // and the question set gained resolver_missed_a_call. Every cached
+        // answer from version 1 was produced without that evidence, so the
+        // bump must invalidate them.
+        2
     }
 
     fn full_strength(&self) -> Severity {
@@ -245,9 +327,10 @@ impl Judge for DeadCodeJudge {
 
     fn state_for(&self, finding: &Finding, ctx: &RepoContext) -> serde_json::Value {
         let file = finding.span.file.as_str();
+        let name = function_name(&finding.message).unwrap_or_default();
         serde_json::json!({
             "function": {
-                "name": function_name(&finding.message).unwrap_or_default(),
+                "name": name,
                 "file": file,
                 "line": finding.span.start_line,
                 "language": language_of(file),
@@ -263,6 +346,14 @@ impl Judge for DeadCodeJudge {
             // not verify. That is the strongest single clue about why a
             // function looks unreachable, and it costs nothing to include.
             "engine_confidence": finding.confidence,
+            // The decisive fact for the #[cfg(test)] helper shape. That
+            // attribute sits on the enclosing module, not on the function,
+            // so nothing about the function itself reveals it.
+            "in_test_context": ctx.in_test_context(file, finding.span.start_line),
+            // Where else this name appears. Without it the state carries no
+            // caller information of any kind, so a private helper called
+            // four times inside its own file looks identical to dead code.
+            "occurrences": occurrence_summary(ctx, &finding.span, name),
         })
     }
 
@@ -310,15 +401,39 @@ impl Judge for DeadCodeJudge {
                 ),
             ),
             (
+                "resolver_missed_a_call".to_string(),
+                Question::noul(
+                    "The engine that produced this finding resolves calls statically and \
+                     cannot follow every one, particularly across crate, package, or module \
+                     boundaries. Given `occurrences`, which lists where this name appears \
+                     elsewhere in the repository, does a real call site exist that the \
+                     engine failed to connect to this function?",
+                    Some(NoulCriteria {
+                        yes: "The occurrence list shows the name used somewhere that reads \
+                              like a call, so a caller exists and the engine simply could \
+                              not resolve it."
+                            .into(),
+                        no: "The occurrence list shows no use that reads like a call. It is \
+                             empty, or its entries are only the declaration, an import, a \
+                             comment, or a different symbol that happens to share the name."
+                            .into(),
+                    }),
+                ),
+            ),
+            (
                 "explanation".to_string(),
                 Question::choice(
-                    "Nothing in this repository calls the function in `function`. What best \
-                     explains why?",
+                    "A static analyzer found no call to the function in `function` anywhere \
+                     in this repository. Analyzers miss calls they cannot resolve, so this \
+                     may be a limit of the analysis rather than a fact about the code. \
+                     Given `occurrences`, `in_test_context`, and `engine_confidence`, what \
+                     best explains the absence of a detected call?",
                     [
                         ("framework_invoked", "A framework, container, or registry calls it without an explicit call site."),
                         ("test_support", "It exists to support tests."),
                         ("public_api", "It is exported for consumers outside this repository."),
                         ("entrypoint", "It is a program entry point, such as a main function or a CLI command handler."),
+                        ("resolver_limitation", "A real call exists somewhere in this repository, but the analyzer could not resolve it, for example across a crate, package, or module boundary."),
                         ("genuinely_unused", "Nothing calls it and nothing is expected to. The code is dead."),
                         ("cannot_tell", "The available evidence does not settle the question."),
                     ],
@@ -396,11 +511,19 @@ mod tests {
         }
     }
 
-    fn answers(fw: f64, test: f64, api: f64, pick: &str, conf: f64) -> BTreeMap<String, Answer> {
+    fn answers(
+        fw: f64,
+        test: f64,
+        api: f64,
+        resolver: f64,
+        pick: &str,
+        conf: f64,
+    ) -> BTreeMap<String, Answer> {
         [
             ("framework_invoked".to_string(), noul(fw)),
             ("test_only".to_string(), noul(test)),
             ("external_api".to_string(), noul(api)),
+            ("resolver_missed_a_call".to_string(), noul(resolver)),
             ("explanation".to_string(), choice(pick, conf)),
         ]
         .into_iter()
@@ -412,6 +535,22 @@ mod tests {
         assert_eq!(function_name("unused function `neverCalled`"), Some("neverCalled"));
         assert_eq!(function_name("possibly unused function `helper`"), Some("helper"));
         assert_eq!(function_name("no backticks here"), None);
+    }
+
+    #[test]
+    fn state_carries_the_occurrence_evidence() {
+        let s = DeadCodeJudge.state_for(&finding(), &ctx());
+        // `helper` is called once from `used`, so the state must show a
+        // caller even though the call graph did not connect it.
+        assert!(s["occurrences"]["in_this_file"].as_u64().unwrap() >= 1);
+        assert!(s["occurrences"]["repo_wide"].as_u64().unwrap() >= 1);
+        let samples = s["occurrences"]["sample_sites"].as_array().unwrap();
+        assert!(
+            samples.iter().any(|v| v.as_str().unwrap().contains("helper() + 1")),
+            "got {samples:?}"
+        );
+        assert_eq!(s["in_test_context"], false);
+        assert_eq!(s["engine_confidence"], "likely");
     }
 
     #[test]
@@ -466,23 +605,32 @@ mod tests {
     }
 
     #[test]
-    fn asks_four_questions_with_canonical_names() {
+    fn asks_five_questions_with_canonical_names() {
         let q = DeadCodeJudge.questions();
         let mut names: Vec<&str> = q.keys().map(|s| s.as_str()).collect();
         names.sort();
-        assert_eq!(names, ["explanation", "external_api", "framework_invoked", "test_only"]);
+        assert_eq!(
+            names,
+            [
+                "explanation",
+                "external_api",
+                "framework_invoked",
+                "resolver_missed_a_call",
+                "test_only",
+            ]
+        );
     }
 
     #[test]
     fn a_confident_framework_hit_dismisses() {
-        let j = DeadCodeJudge.judge(&finding(), &answers(0.91, 0.02, 0.1, "framework_invoked", 0.9), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(&finding(), &answers(0.91, 0.02, 0.1, 0.05, "framework_invoked", 0.9), &DeadCodeThresholds::default());
         assert_eq!(j.verdict, Verdict::Dismiss);
         assert!(j.reason.contains("framework"), "got {}", j.reason);
     }
 
     #[test]
     fn a_confident_test_helper_dismisses() {
-        let j = DeadCodeJudge.judge(&finding(), &answers(0.05, 0.88, 0.1, "test_support", 0.9), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(&finding(), &answers(0.05, 0.88, 0.1, 0.05, "test_support", 0.9), &DeadCodeThresholds::default());
         assert_eq!(j.verdict, Verdict::Dismiss);
         assert!(j.reason.contains("test"), "got {}", j.reason);
     }
@@ -493,7 +641,7 @@ mod tests {
         // covered by a_finding_the_engine_hedged_on_is_never_strengthened.
         let j = DeadCodeJudge.judge(
             &certain_finding(),
-            &answers(0.04, 0.03, 0.05, "genuinely_unused", 0.85),
+            &answers(0.04, 0.03, 0.05, 0.02, "genuinely_unused", 0.85),
             &DeadCodeThresholds::default(),
         );
         assert_eq!(j.verdict, Verdict::Strengthen);
@@ -501,7 +649,7 @@ mod tests {
 
     #[test]
     fn low_signals_with_an_unsure_explanation_keeps() {
-        let j = DeadCodeJudge.judge(&finding(), &answers(0.04, 0.03, 0.05, "genuinely_unused", 0.4), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(&finding(), &answers(0.04, 0.03, 0.05, 0.02, "genuinely_unused", 0.4), &DeadCodeThresholds::default());
         assert_eq!(j.verdict, Verdict::Keep);
     }
 
@@ -511,7 +659,7 @@ mod tests {
         // Some((_, conf)) makes this the only failing test in the suite.
         let j = DeadCodeJudge.judge(
             &certain_finding(),
-            &answers(0.04, 0.03, 0.05, "cannot_tell", 0.90),
+            &answers(0.04, 0.03, 0.05, 0.02, "cannot_tell", 0.90),
             &DeadCodeThresholds::default(),
         );
         assert_eq!(j.verdict, Verdict::Keep);
@@ -524,7 +672,7 @@ mod tests {
         // and this is the shape every cross-crate false positive takes.
         let j = DeadCodeJudge.judge(
             &finding(),
-            &answers(0.04, 0.03, 0.05, "genuinely_unused", 0.85),
+            &answers(0.04, 0.03, 0.05, 0.02, "genuinely_unused", 0.85),
             &DeadCodeThresholds::default(),
         );
         assert_eq!(j.verdict, Verdict::Keep);
@@ -535,7 +683,7 @@ mod tests {
     fn a_confident_entrypoint_is_dismissed() {
         let j = DeadCodeJudge.judge(
             &certain_finding(),
-            &answers(0.04, 0.03, 0.05, "entrypoint", 0.90),
+            &answers(0.04, 0.03, 0.05, 0.02, "entrypoint", 0.90),
             &DeadCodeThresholds::default(),
         );
         assert_eq!(j.verdict, Verdict::Dismiss);
@@ -544,7 +692,7 @@ mod tests {
     #[test]
     fn public_api_dismisses_at_the_info_floor_and_weakens_above_it() {
         let cfg = DeadCodeThresholds::default();
-        let a = answers(0.05, 0.05, 0.9, "public_api", 0.9);
+        let a = answers(0.05, 0.05, 0.9, 0.05, "public_api", 0.9);
         // Already at Info: Weaken would write back identical values, so the
         // only lever with an observable effect is Dismiss.
         assert_eq!(DeadCodeJudge.judge(&finding(), &a, &cfg).verdict, Verdict::Dismiss);
@@ -559,9 +707,9 @@ mod tests {
     fn thresholds_are_inclusive_at_the_boundary() {
         // Pins >= against >. Nothing else in the suite distinguishes them.
         let cfg = DeadCodeThresholds::default();
-        let at = answers(cfg.dismiss_at, 0.0, 0.0, "cannot_tell", 0.0);
+        let at = answers(cfg.dismiss_at, 0.0, 0.0, 0.0, "cannot_tell", 0.0);
         assert_eq!(DeadCodeJudge.judge(&finding(), &at, &cfg).verdict, Verdict::Dismiss);
-        let just_below = answers(cfg.dismiss_at - 0.001, 0.0, 0.0, "cannot_tell", 0.0);
+        let just_below = answers(cfg.dismiss_at - 0.001, 0.0, 0.0, 0.0, "cannot_tell", 0.0);
         assert_ne!(
             DeadCodeJudge.judge(&finding(), &just_below, &cfg).verdict,
             Verdict::Dismiss
@@ -569,8 +717,33 @@ mod tests {
     }
 
     #[test]
+    fn a_resolver_hit_dismisses_even_with_every_other_signal_low() {
+        // The cross-crate shape: nothing special about the function, but the
+        // name appears at a real call site the engine could not connect.
+        let j = DeadCodeJudge.judge(
+            &certain_finding(),
+            &answers(0.04, 0.03, 0.05, 0.92, "resolver_limitation", 0.9),
+            &DeadCodeThresholds::default(),
+        );
+        assert_eq!(j.verdict, Verdict::Dismiss);
+        assert!(j.reason.contains("could not resolve"), "got {}", j.reason);
+    }
+
+    #[test]
+    fn an_absent_resolver_answer_neither_dismisses_nor_strengthens() {
+        // A cached answer predating this question carries no resolver
+        // evidence. Treating absence as low would arm Strengthen on exactly
+        // the population the question exists to protect; treating it as high
+        // would dismiss everything.
+        let mut a = answers(0.04, 0.03, 0.05, 0.02, "genuinely_unused", 0.85);
+        a.remove("resolver_missed_a_call");
+        let j = DeadCodeJudge.judge(&certain_finding(), &a, &DeadCodeThresholds::default());
+        assert_eq!(j.verdict, Verdict::Keep);
+    }
+
+    #[test]
     fn a_middling_answer_keeps() {
-        let j = DeadCodeJudge.judge(&finding(), &answers(0.5, 0.4, 0.3, "cannot_tell", 0.4), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(&finding(), &answers(0.5, 0.4, 0.3, 0.3, "cannot_tell", 0.4), &DeadCodeThresholds::default());
         assert_eq!(j.verdict, Verdict::Keep);
     }
 
@@ -582,7 +755,7 @@ mod tests {
 
     #[test]
     fn every_raw_probability_is_recorded_on_the_judgment() {
-        let j = DeadCodeJudge.judge(&finding(), &answers(0.91, 0.02, 0.1, "framework_invoked", 0.9), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(&finding(), &answers(0.91, 0.02, 0.1, 0.05, "framework_invoked", 0.9), &DeadCodeThresholds::default());
         assert_eq!(j.answers["framework_invoked"], 0.91);
         assert_eq!(j.answers["explanation"]["choice"], "framework_invoked");
     }

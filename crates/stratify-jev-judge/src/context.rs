@@ -39,6 +39,9 @@ struct IgnoreToml {
     ignore: IgnoreSection,
 }
 
+/// Identifier -> every (file index, 1-based line) it occurs at.
+type IdentifierIndex = HashMap<String, Vec<(usize, usize)>>;
+
 /// Everything a judge needs about the repo under analysis: the file
 /// inventory and on-demand source reads, both scoped by the same
 /// `stratify.toml` `[ignore] paths` globs the engine honors.
@@ -47,6 +50,8 @@ pub struct RepoContext {
     root: PathBuf,
     files: Vec<FileEntry>,
     cache: RefCell<HashMap<String, Option<String>>>,
+    /// Built lazily on first `occurrences` call, then reused for the whole run.
+    index: RefCell<Option<IdentifierIndex>>,
 }
 
 impl RepoContext {
@@ -84,11 +89,105 @@ impl RepoContext {
             root,
             files,
             cache: RefCell::new(HashMap::new()),
+            index: RefCell::new(None),
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Every whole-word occurrence of `name` across the file inventory.
+    ///
+    /// The index is built once on first call and reused for the rest of the
+    /// run, so this stays one pass over the repo no matter how many findings
+    /// ask. Without it, judging N findings against M files would be N times M
+    /// scans.
+    ///
+    /// Name collisions make the result a hint, not a proof, which is the
+    /// right strength for a model input. Present it as a count with sample
+    /// lines, never as a claim that a call exists.
+    pub fn occurrences(&self, name: &str) -> Vec<Occurrence> {
+        if name.is_empty() {
+            return Vec::new();
+        }
+        self.build_index();
+        let index = self.index.borrow();
+        let Some(hits) = index.as_ref().and_then(|m| m.get(name)) else {
+            return Vec::new();
+        };
+        hits.iter()
+            .filter_map(|(file_idx, line)| {
+                let rel = &self.files.get(*file_idx)?.rel;
+                let text = self.file_text(rel)?;
+                let content = text.lines().nth(line - 1)?.trim().to_string();
+                Some(Occurrence {
+                    file: rel.clone(),
+                    line: *line,
+                    text: content,
+                })
+            })
+            .collect()
+    }
+
+    fn build_index(&self) {
+        if self.index.borrow().is_some() {
+            return;
+        }
+        let mut map: IdentifierIndex = HashMap::new();
+        for (file_idx, entry) in self.files.iter().enumerate() {
+            let Some(text) = self.file_text(&entry.rel) else {
+                continue;
+            };
+            for (i, line) in text.lines().enumerate() {
+                for_each_identifier(line, |ident| {
+                    map.entry(ident.to_string())
+                        .or_default()
+                        .push((file_idx, i + 1));
+                });
+            }
+        }
+        *self.index.borrow_mut() = Some(map);
+    }
+
+    /// Whether `line` in `file` sits inside test code.
+    ///
+    /// A deliberate heuristic, and the single decisive fact for the
+    /// `#[cfg(test)]` helper shape: that attribute sits on the enclosing
+    /// module, not on the function, so nothing about the function itself
+    /// reveals it. Brace counting ignores braces inside strings and
+    /// comments, which is acceptable for a model hint and would not be for
+    /// a parser.
+    pub fn in_test_context(&self, file: &str, line: usize) -> bool {
+        if path_is_tests(file) {
+            return true;
+        }
+        let Some(text) = self.file_text(file) else {
+            return false;
+        };
+        let mut depth: i32 = 0;
+        let mut test_depth: Option<i32> = None;
+        for (i, l) in text.lines().enumerate() {
+            if i + 1 > line {
+                break;
+            }
+            if test_depth.is_none() && opens_test_block(l) {
+                test_depth = Some(depth);
+            }
+            for ch in l.chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if test_depth.is_some_and(|d| depth <= d) {
+                            test_depth = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        test_depth.is_some()
     }
 
     pub fn files(&self) -> &[FileEntry] {
@@ -128,6 +227,61 @@ impl RepoContext {
             .unwrap_or_else(|| text.len());
         Some(text[line_start..line_end].to_string())
     }
+}
+
+/// One place a name appears in the repository, outside its own declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occurrence {
+    pub file: String,
+    pub line: usize,
+    pub text: String,
+}
+
+/// Call `f` with every identifier-like run in `line`. Bytes outside
+/// `[A-Za-z0-9_]` end a run, so a multi-byte character splits identifiers
+/// rather than joining them. Every slice boundary is an ASCII byte, so this
+/// cannot panic on non-ASCII source.
+fn for_each_identifier(line: &str, mut f: impl FnMut(&str)) {
+    let bytes = line.as_bytes();
+    let mut start: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        let is_ident = b.is_ascii_alphanumeric() || b == b'_';
+        match (is_ident, start) {
+            (true, None) => start = Some(i),
+            (false, Some(st)) => {
+                f(&line[st..i]);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(st) = start {
+        f(&line[st..]);
+    }
+}
+
+/// True when the path alone says the file holds tests.
+fn path_is_tests(rel: &str) -> bool {
+    let stem = rel.rsplit('/').next().unwrap_or(rel);
+    rel.starts_with("tests/")
+        || rel.contains("/tests/")
+        || rel.contains("/__tests__/")
+        || stem.starts_with("test_")
+        || stem.contains("_test.")
+        || stem.contains(".test.")
+        || stem.contains("_spec.")
+        || stem.contains(".spec.")
+}
+
+/// True when the line opens a block whose contents are tests.
+fn opens_test_block(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("#[cfg(test)]")
+        || t.starts_with("mod tests")
+        || t.starts_with("pub mod tests")
+        || t.starts_with("describe(")
+        || t.starts_with("class Test")
+        || (t.starts_with("class ") && t.contains("Test") && t.ends_with(':'))
 }
 
 /// Largest char boundary at or below `i`. Index 0 is always a boundary, so
@@ -260,6 +414,62 @@ mod tests {
     fn a_missing_root_is_an_error_not_an_empty_inventory() {
         let err = RepoContext::new(PathBuf::from("/definitely/not/a/real/path")).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn occurrences_finds_whole_word_uses_and_skips_substrings() {
+        let ctx = fixture();
+        // `helper` is declared once in src/lib.rs and called once from `used`.
+        let hits = ctx.occurrences("helper");
+        assert!(hits.len() >= 2, "got {hits:?}");
+        assert!(hits.iter().all(|o| o.file == "src/lib.rs"));
+        assert!(hits.iter().any(|o| o.text.contains("helper() + 1")));
+        // A substring of a longer identifier is not an occurrence.
+        assert!(ctx.occurrences("help").is_empty());
+        assert!(ctx.occurrences("").is_empty());
+    }
+
+    #[test]
+    fn occurrences_are_empty_for_an_unknown_name() {
+        assert!(fixture().occurrences("no_such_identifier_anywhere").is_empty());
+    }
+
+    #[test]
+    fn in_test_context_is_false_for_ordinary_production_code() {
+        let ctx = fixture();
+        let line = ctx
+            .file_text("src/lib.rs")
+            .unwrap()
+            .lines()
+            .position(|l| l.contains("fn helper"))
+            .unwrap()
+            + 1;
+        assert!(!ctx.in_test_context("src/lib.rs", line));
+    }
+
+    #[test]
+    fn in_test_context_is_true_inside_a_cfg_test_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "pub fn prod() -> u32 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n    fn helper() {}\n}\n\npub fn after() {}\n",
+        )
+        .unwrap();
+        let ctx = RepoContext::new(dir.path().to_path_buf()).unwrap();
+        // `fn helper` sits on line 7, inside the test module.
+        assert!(ctx.in_test_context("src/a.rs", 7));
+        // `fn prod` on line 1 and `fn after` on line 10 do not.
+        assert!(!ctx.in_test_context("src/a.rs", 1));
+        assert!(!ctx.in_test_context("src/a.rs", 10));
+    }
+
+    #[test]
+    fn a_path_under_tests_counts_as_test_context_on_its_own() {
+        let ctx = fixture();
+        assert!(ctx.in_test_context("tests/whatever.rs", 1));
+        assert!(ctx.in_test_context("src/thing_test.rs", 1));
+        assert!(!ctx.in_test_context("src/lib.rs", 1));
     }
 
     #[test]

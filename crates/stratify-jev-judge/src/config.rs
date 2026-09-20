@@ -9,6 +9,7 @@ fn d_dismiss_at() -> f64 { 0.75 }
 fn d_api_at() -> f64 { 0.75 }
 fn d_low_at() -> f64 { 0.25 }
 fn d_explanation_at() -> f64 { 0.70 }
+fn d_resolver_at() -> f64 { 0.70 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeadCodeThresholds {
@@ -24,6 +25,9 @@ pub struct DeadCodeThresholds {
     /// Choice confidence floor for genuinely_unused to give Strengthen.
     #[serde(default = "d_explanation_at")]
     pub explanation_at: f64,
+    /// resolver_missed_a_call above this gives Dismiss.
+    #[serde(default = "d_resolver_at")]
+    pub resolver_at: f64,
 }
 
 impl Default for DeadCodeThresholds {
@@ -33,6 +37,7 @@ impl Default for DeadCodeThresholds {
             api_at: d_api_at(),
             low_at: d_low_at(),
             explanation_at: d_explanation_at(),
+            resolver_at: d_resolver_at(),
         }
     }
 }
