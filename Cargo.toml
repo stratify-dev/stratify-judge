@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/stratify-jev-judge"]
+members = ["crates/jev-client", "crates/stratify-jev-judge"]
 
 [workspace.package]
 edition = "2021"
