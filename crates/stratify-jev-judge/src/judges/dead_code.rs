@@ -1,7 +1,7 @@
 use crate::config::{DeadCodeThresholds, Thresholds};
 use crate::context::{language_of, RepoContext};
 use crate::judges::Judge;
-use crate::model::{Finding, Severity};
+use crate::model::{Confidence, Finding, Severity};
 use crate::verdict::{Judgment, Verdict};
 use jev_client::{Answer, NoulCriteria, Question};
 use std::collections::BTreeMap;
@@ -14,6 +14,12 @@ pub fn function_name(message: &str) -> Option<&str> {
     let start = message.find('`')? + 1;
     let rest = &message[start..];
     let end = rest.find('`')?;
+    // An empty pair of backticks is not a name. Returning Some("") would
+    // put a nameless function in the state, indistinguishable from the
+    // absent case, and the questions would then refer to nothing.
+    if end == 0 {
+        return None;
+    }
     Some(&rest[..end])
 }
 
@@ -74,7 +80,15 @@ fn project_markers(ctx: &RepoContext) -> Vec<String> {
         }
     }
     if let Ok(t) = std::fs::read_to_string(root.join("package.json")) {
-        if t.contains("\"private\"") && t.contains("true") {
+        // Match key and value together. `t.contains("\"private\"") &&
+        // t.contains("true")` fires on `"private": false` beside any
+        // unrelated `true`, which would wrongly steer external_api low on a
+        // genuinely published package.
+        if serde_json::from_str::<serde_json::Value>(&t)
+            .ok()
+            .and_then(|v| v.get("private").and_then(serde_json::Value::as_bool))
+            == Some(true)
+        {
             out.push("package.json declares private: true".into());
         }
     }
@@ -90,6 +104,7 @@ fn project_markers(ctx: &RepoContext) -> Vec<String> {
 impl DeadCodeJudge {
     pub fn judge(
         &self,
+        finding: &Finding,
         answers: &BTreeMap<String, Answer>,
         cfg: &DeadCodeThresholds,
     ) -> Judgment {
@@ -115,7 +130,14 @@ impl DeadCodeJudge {
             );
         }
 
-        let (verdict, reason) = decide(fw, test, api, explanation, cfg);
+        let (verdict, reason) = decide(
+            fw,
+            test,
+            api,
+            explanation,
+            (finding.severity, finding.confidence),
+            cfg,
+        );
 
         Judgment {
             judge: "dead_code".into(),
@@ -129,11 +151,17 @@ impl DeadCodeJudge {
 
 /// Policy lives here alone, separate from the answers, so retuning a
 /// threshold never needs a new request.
+///
+/// `engine` is the severity and confidence the engine itself assigned. The
+/// policy needs it for two reasons: to know whether a verdict would change
+/// anything, and because the engine's own hedging is the single strongest
+/// signal available about why a function looks unreachable.
 fn decide(
     fw: Option<f64>,
     test: Option<f64>,
     api: Option<f64>,
     explanation: Option<(&str, f64)>,
+    engine: (Severity, Confidence),
     cfg: &DeadCodeThresholds,
 ) -> (Verdict, String) {
     // A missing answer never produces an action. Absence is not evidence.
@@ -147,18 +175,54 @@ fn decide(
     if test >= cfg.dismiss_at {
         return (Verdict::Dismiss, format!("test-only helper ({test:.2})"));
     }
+    if let Some(("entrypoint", conf)) = explanation {
+        if conf >= cfg.explanation_at {
+            return (
+                Verdict::Dismiss,
+                format!("program entry point, not called from inside the repo ({conf:.2})"),
+            );
+        }
+    }
     if api >= cfg.api_at {
-        return (
-            Verdict::Weaken,
-            format!("public API surface for outside consumers ({api:.2})"),
-        );
+        // Weakening a finding already at the Info floor changes nothing
+        // observable, and public symbols in library mode are exactly the
+        // population that arrives there. Dismiss is the only lever with an
+        // effect on them. Where the engine was certain, the step down is
+        // real and Weaken is the proportionate action.
+        return if engine.0 <= Severity::Info {
+            (
+                Verdict::Dismiss,
+                format!("public API surface for outside consumers ({api:.2})"),
+            )
+        } else {
+            (
+                Verdict::Weaken,
+                format!("public API surface for outside consumers ({api:.2})"),
+            )
+        };
     }
     if fw < cfg.low_at && test < cfg.low_at && api < cfg.low_at {
         if let Some(("genuinely_unused", conf)) = explanation {
             if conf >= cfg.explanation_at {
+                // The guard that holds even when every question fails.
+                // Confidence::Likely on a dead_code finding means the engine
+                // reached the symbol through an edge it could not confirm, or
+                // the symbol is public in library mode. Both mean "a caller
+                // may exist that I could not verify". Promoting exactly that
+                // population to Certain inverts the engine's own epistemics,
+                // and nothing in the state outranks it.
+                if engine.1 == Confidence::Certain {
+                    return (
+                        Verdict::Strengthen,
+                        format!("no caller and no hidden entry point ({conf:.2})"),
+                    );
+                }
                 return (
-                    Verdict::Strengthen,
-                    format!("no caller and no hidden entry point ({conf:.2})"),
+                    Verdict::Keep,
+                    format!(
+                        "looks unused ({conf:.2}), but the engine could not confirm \
+                         reachability either, so its hedge stands"
+                    ),
                 );
             }
         }
@@ -193,6 +257,12 @@ impl Judge for DeadCodeJudge {
             "file_imports": imports_of(ctx, file),
             "project_markers": project_markers(ctx),
             "engine_message": finding.message,
+            // The engine's own hedge. "likely" means it reached the symbol
+            // through an edge it could not confirm, or the symbol is public
+            // in library mode: either way a caller may exist that it could
+            // not verify. That is the strongest single clue about why a
+            // function looks unreachable, and it costs nothing to include.
+            "engine_confidence": finding.confidence,
         })
     }
 
@@ -218,7 +288,7 @@ impl Judge for DeadCodeJudge {
                 "test_only".to_string(),
                 Question::noul(
                     "Does the function in `function` exist only to support tests, such as a \
-                     fixture builder, a test helper, or a assertion utility?",
+                     fixture builder, a test helper, or an assertion utility?",
                     Some(NoulCriteria {
                         yes: "Its purpose is setting up or supporting tests, and production \
                               code has no reason to call it.".into(),
@@ -259,8 +329,13 @@ impl Judge for DeadCodeJudge {
         .collect()
     }
 
-    fn judge(&self, answers: &BTreeMap<String, Answer>, cfg: &Thresholds) -> Judgment {
-        DeadCodeJudge::judge(self, answers, &cfg.dead_code)
+    fn judge(
+        &self,
+        finding: &Finding,
+        answers: &BTreeMap<String, Answer>,
+        cfg: &Thresholds,
+    ) -> Judgment {
+        DeadCodeJudge::judge(self, finding, answers, &cfg.dead_code)
     }
 }
 
@@ -295,6 +370,17 @@ mod tests {
             },
             confidence: Confidence::Likely,
             extra: serde_json::Map::new(),
+        }
+    }
+
+    /// A finding the engine did NOT hedge on: private and unreached, so it
+    /// arrives at full strength. Shapes 2 and 3 of the ground truth.
+    fn certain_finding() -> Finding {
+        Finding {
+            severity: Severity::Warning,
+            confidence: Confidence::Certain,
+            message: "unused function `helper`".into(),
+            ..finding()
         }
     }
 
@@ -389,51 +475,114 @@ mod tests {
 
     #[test]
     fn a_confident_framework_hit_dismisses() {
-        let j = DeadCodeJudge.judge(&answers(0.91, 0.02, 0.1, "framework_invoked", 0.9), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(&finding(), &answers(0.91, 0.02, 0.1, "framework_invoked", 0.9), &DeadCodeThresholds::default());
         assert_eq!(j.verdict, Verdict::Dismiss);
         assert!(j.reason.contains("framework"), "got {}", j.reason);
     }
 
     #[test]
     fn a_confident_test_helper_dismisses() {
-        let j = DeadCodeJudge.judge(&answers(0.05, 0.88, 0.1, "test_support", 0.9), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(&finding(), &answers(0.05, 0.88, 0.1, "test_support", 0.9), &DeadCodeThresholds::default());
         assert_eq!(j.verdict, Verdict::Dismiss);
         assert!(j.reason.contains("test"), "got {}", j.reason);
     }
 
     #[test]
-    fn a_public_api_symbol_weakens_rather_than_dismissing() {
-        let j = DeadCodeJudge.judge(&answers(0.05, 0.05, 0.9, "public_api", 0.9), &DeadCodeThresholds::default());
-        assert_eq!(j.verdict, Verdict::Weaken);
-    }
-
-    #[test]
     fn all_signals_low_plus_a_confident_explanation_strengthens() {
-        let j = DeadCodeJudge.judge(&answers(0.04, 0.03, 0.05, "genuinely_unused", 0.85), &DeadCodeThresholds::default());
+        // Only where the engine itself was Certain. The hedged case is
+        // covered by a_finding_the_engine_hedged_on_is_never_strengthened.
+        let j = DeadCodeJudge.judge(
+            &certain_finding(),
+            &answers(0.04, 0.03, 0.05, "genuinely_unused", 0.85),
+            &DeadCodeThresholds::default(),
+        );
         assert_eq!(j.verdict, Verdict::Strengthen);
     }
 
     #[test]
     fn low_signals_with_an_unsure_explanation_keeps() {
-        let j = DeadCodeJudge.judge(&answers(0.04, 0.03, 0.05, "genuinely_unused", 0.4), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(&finding(), &answers(0.04, 0.03, 0.05, "genuinely_unused", 0.4), &DeadCodeThresholds::default());
         assert_eq!(j.verdict, Verdict::Keep);
     }
 
     #[test]
+    fn a_confident_non_unused_explanation_never_strengthens() {
+        // Guards the genuinely_unused conjunct. Mutating the match to
+        // Some((_, conf)) makes this the only failing test in the suite.
+        let j = DeadCodeJudge.judge(
+            &certain_finding(),
+            &answers(0.04, 0.03, 0.05, "cannot_tell", 0.90),
+            &DeadCodeThresholds::default(),
+        );
+        assert_eq!(j.verdict, Verdict::Keep);
+    }
+
+    #[test]
+    fn a_finding_the_engine_hedged_on_is_never_strengthened() {
+        // The engine reports Likely when it could not confirm reachability.
+        // Promoting that population to Certain inverts its own epistemics,
+        // and this is the shape every cross-crate false positive takes.
+        let j = DeadCodeJudge.judge(
+            &finding(),
+            &answers(0.04, 0.03, 0.05, "genuinely_unused", 0.85),
+            &DeadCodeThresholds::default(),
+        );
+        assert_eq!(j.verdict, Verdict::Keep);
+        assert!(j.reason.contains("engine could not confirm"), "got {}", j.reason);
+    }
+
+    #[test]
+    fn a_confident_entrypoint_is_dismissed() {
+        let j = DeadCodeJudge.judge(
+            &certain_finding(),
+            &answers(0.04, 0.03, 0.05, "entrypoint", 0.90),
+            &DeadCodeThresholds::default(),
+        );
+        assert_eq!(j.verdict, Verdict::Dismiss);
+    }
+
+    #[test]
+    fn public_api_dismisses_at_the_info_floor_and_weakens_above_it() {
+        let cfg = DeadCodeThresholds::default();
+        let a = answers(0.05, 0.05, 0.9, "public_api", 0.9);
+        // Already at Info: Weaken would write back identical values, so the
+        // only lever with an observable effect is Dismiss.
+        assert_eq!(DeadCodeJudge.judge(&finding(), &a, &cfg).verdict, Verdict::Dismiss);
+        // At Warning/Certain the step down is real.
+        assert_eq!(
+            DeadCodeJudge.judge(&certain_finding(), &a, &cfg).verdict,
+            Verdict::Weaken
+        );
+    }
+
+    #[test]
+    fn thresholds_are_inclusive_at_the_boundary() {
+        // Pins >= against >. Nothing else in the suite distinguishes them.
+        let cfg = DeadCodeThresholds::default();
+        let at = answers(cfg.dismiss_at, 0.0, 0.0, "cannot_tell", 0.0);
+        assert_eq!(DeadCodeJudge.judge(&finding(), &at, &cfg).verdict, Verdict::Dismiss);
+        let just_below = answers(cfg.dismiss_at - 0.001, 0.0, 0.0, "cannot_tell", 0.0);
+        assert_ne!(
+            DeadCodeJudge.judge(&finding(), &just_below, &cfg).verdict,
+            Verdict::Dismiss
+        );
+    }
+
+    #[test]
     fn a_middling_answer_keeps() {
-        let j = DeadCodeJudge.judge(&answers(0.5, 0.4, 0.3, "cannot_tell", 0.4), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(&finding(), &answers(0.5, 0.4, 0.3, "cannot_tell", 0.4), &DeadCodeThresholds::default());
         assert_eq!(j.verdict, Verdict::Keep);
     }
 
     #[test]
     fn missing_answers_keep_rather_than_guessing() {
-        let j = DeadCodeJudge.judge(&BTreeMap::new(), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(&finding(), &BTreeMap::new(), &DeadCodeThresholds::default());
         assert_eq!(j.verdict, Verdict::Keep);
     }
 
     #[test]
     fn every_raw_probability_is_recorded_on_the_judgment() {
-        let j = DeadCodeJudge.judge(&answers(0.91, 0.02, 0.1, "framework_invoked", 0.9), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(&finding(), &answers(0.91, 0.02, 0.1, "framework_invoked", 0.9), &DeadCodeThresholds::default());
         assert_eq!(j.answers["framework_invoked"], 0.91);
         assert_eq!(j.answers["explanation"]["choice"], "framework_invoked");
     }

@@ -25,8 +25,14 @@ pub trait Judge: Send + Sync {
     /// Questions under canonical names. The driver prefixes them per batch slot.
     fn questions(&self) -> BTreeMap<String, Question>;
 
-    /// Map raw answers to a verdict and a reason.
-    fn judge(&self, answers: &BTreeMap<String, Answer>, cfg: &Thresholds) -> Judgment;
+    /// Map raw answers to a verdict and a reason. The finding is passed so
+    /// policy can read the engine's own severity and confidence.
+    fn judge(
+        &self,
+        finding: &Finding,
+        answers: &BTreeMap<String, Answer>,
+        cfg: &Thresholds,
+    ) -> Judgment;
 }
 
 /// Every judge registered in this build.
