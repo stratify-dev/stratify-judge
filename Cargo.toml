@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/stratify-jev-judge"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/stratify-dev/stratify-jev"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
