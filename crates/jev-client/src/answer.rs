@@ -103,6 +103,38 @@ mod tests {
         assert_eq!(r.answers["cognitive_load"].as_score(), Some((2.4, 0.62)));
     }
 
+    /// Task 6 writes answers to a disk cache as JSON and reads them back,
+    /// so the round trip is a contract another task depends on. Without
+    /// this test, a later change to the enum that breaks serialization
+    /// passes every test in this crate and surfaces as a confusing cache
+    /// failure instead of an answer-shape failure.
+    #[test]
+    fn every_answer_variant_survives_a_json_round_trip() {
+        let cases = vec![
+            Answer::Noul { noul: 0.91 },
+            Answer::Choice {
+                choice: "framework_invoked".into(),
+                probabilities: [("framework_invoked".to_string(), 0.88)]
+                    .into_iter()
+                    .collect(),
+                confidence: 0.88,
+            },
+            Answer::Score {
+                score: 2.4,
+                legend: [("0".to_string(), "flat".to_string())]
+                    .into_iter()
+                    .collect(),
+                probabilities: [("0".to_string(), 0.1)].into_iter().collect(),
+                confidence: 0.62,
+            },
+        ];
+        for original in cases {
+            let text = serde_json::to_string(&original).unwrap();
+            let back: Answer = serde_json::from_str(&text).unwrap();
+            assert_eq!(back, original, "round trip changed the answer: {text}");
+        }
+    }
+
     #[test]
     fn accessors_return_none_for_the_wrong_shape() {
         let r: SystemOneResponse = serde_json::from_str(BODY).unwrap();
