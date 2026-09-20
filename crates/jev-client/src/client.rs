@@ -31,6 +31,20 @@ impl Default for RetryPolicy {
     }
 }
 
+/// The key rule, separated from the env read so it is testable without
+/// mutating process-global state. Rust runs tests in one process across
+/// threads, so a test that sets an env var races every other test that
+/// reads one. An empty key is worse than no key: it would send `Bearer `
+/// and earn a 401 on every request instead of cleanly running without
+/// judgment.
+fn usable_key(raw: Option<String>) -> Option<String> {
+    let key = raw?;
+    if key.trim().is_empty() {
+        return None;
+    }
+    Some(key)
+}
+
 pub struct Client {
     http: reqwest::Client,
     base: String,
@@ -51,13 +65,10 @@ impl Client {
         }
     }
 
-    /// None when TYPESAFE_API_KEY is unset or empty. The caller treats that
-    /// as "run without judgment", never as an error.
+    /// None when TYPESAFE_API_KEY is unset, empty, or whitespace only. The
+    /// caller treats that as "run without judgment", never as an error.
     pub fn from_env() -> Option<Client> {
-        let key = std::env::var(ENV_API_KEY).ok()?;
-        if key.trim().is_empty() {
-            return None;
-        }
+        let key = usable_key(std::env::var(ENV_API_KEY).ok())?;
         Some(Client::new(DEFAULT_BASE_URL.to_string(), key))
     }
 
@@ -119,9 +130,12 @@ impl Client {
         }
     }
 
+    /// `ask` must never panic, and `base_delay` is a public field a caller
+    /// can set to anything, so the multiply saturates rather than
+    /// overflowing. The shift is capped at 6, well under u32's width.
     async fn backoff(&self, attempt: u32) {
         let factor = 1u32 << (attempt.saturating_sub(1)).min(6);
-        tokio::time::sleep(self.retry.base_delay * factor).await;
+        tokio::time::sleep(self.retry.base_delay.saturating_mul(factor)).await;
     }
 }
 
@@ -234,5 +248,38 @@ mod tests {
     fn from_env_is_none_without_a_key() {
         std::env::remove_var("TYPESAFE_API_KEY");
         assert!(Client::from_env().is_none());
+    }
+
+    #[test]
+    fn a_key_that_is_absent_empty_or_whitespace_is_not_usable() {
+        assert_eq!(usable_key(None), None);
+        assert_eq!(usable_key(Some(String::new())), None);
+        assert_eq!(usable_key(Some("   \t\n  ".into())), None);
+    }
+
+    #[test]
+    fn a_real_key_is_usable_and_kept_verbatim() {
+        assert_eq!(
+            usable_key(Some("  sk-abc123  ".into())),
+            Some("  sk-abc123  ".to_string()),
+            "trimming is a usability test, not a transformation: the key is sent as given"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pathological_base_delay_saturates_instead_of_panicking() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .mount(&server)
+            .await;
+        // Duration's Mul<u32> panics on overflow. base_delay is a public
+        // field, so a caller can reach that. The first attempt succeeds
+        // here, proving construction with such a policy is itself safe.
+        let c = Client::new(server.uri(), "test-key".into()).with_retry(RetryPolicy {
+            max_attempts: 2,
+            base_delay: Duration::MAX,
+        });
+        assert!(c.ask(&req()).await.is_ok());
     }
 }
