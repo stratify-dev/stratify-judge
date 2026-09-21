@@ -66,11 +66,20 @@ fn occurrence_summary(
 ) -> serde_json::Value {
     const MAX_SAMPLES: usize = 8;
     let all = ctx.occurrences(name);
-    let elsewhere: Vec<_> = all
+    let mut elsewhere: Vec<_> = all
         .into_iter()
         .filter(|o| !(o.file == decl.file && o.line == decl.start_line))
         .collect();
     let in_file = elsewhere.iter().filter(|o| o.file == decl.file).count();
+    let repo_wide = elsewhere.len();
+
+    // Rank before truncating. Path order is not relevance: measured on the
+    // real repo, `span` has 183 occurrences whose first eight by path are
+    // all struct-field lines and not one is a call. The question asks the
+    // model whether the listed entries read like calls, so showing it eight
+    // that do not, while real calls exist, steers it to the answer that
+    // satisfies the Strengthen precondition.
+    elsewhere.sort_by_key(|o| (!looks_like_call(&o.text, name), o.file != decl.file));
     let samples: Vec<String> = elsewhere
         .iter()
         .take(MAX_SAMPLES)
@@ -78,9 +87,19 @@ fn occurrence_summary(
         .collect();
     serde_json::json!({
         "in_this_file": in_file,
-        "repo_wide": elsewhere.len(),
+        "repo_wide": repo_wide,
         "sample_sites": samples,
     })
+}
+
+/// Whether a source line uses `name` the way a call site would. A hint for
+/// ranking evidence, never a parse: `name(`, `.name(` and `::name` cover
+/// plain calls, method calls and qualified paths across the six supported
+/// languages.
+fn looks_like_call(text: &str, name: &str) -> bool {
+    text.contains(&format!("{name}("))
+        || text.contains(&format!(".{name}("))
+        || text.contains(&format!("::{name}"))
 }
 
 /// Import-looking lines from the head of the file, capped so state stays small.
@@ -117,12 +136,14 @@ fn project_markers(ctx: &RepoContext) -> Vec<String> {
         // repos where it matters most, and a `pub` item crossing a crate
         // boundary inside the repo looks like a public API.
         if t.contains("[workspace]") {
-            let members = t.matches("crates/").count().max(1);
-            out.push(format!(
-                "Cargo workspace with roughly {members} member crates: `pub` items \
-                 are called across crates inside this repository, not only by \
-                 outside consumers"
-            ));
+            // No member count. A glob like members = ["crates/*"] makes any
+            // substring tally wrong, and a wrong number in text sent to the
+            // model is worse than no number.
+            out.push(
+                "Cargo workspace: `pub` items are called across member crates inside \
+                 this repository, not only by outside consumers"
+                    .into(),
+            );
         }
     }
     if let Ok(t) = std::fs::read_to_string(root.join("package.json")) {
@@ -249,12 +270,23 @@ fn decide(
             );
         }
     }
+    // Checked before the public-API branch: a claimed resolved call is
+    // stronger false-positive evidence than a public-API guess, and a
+    // finding scoring high on both would otherwise only Weaken.
+    if let Some(("resolver_limitation", conf)) = explanation {
+        if conf >= cfg.explanation_at {
+            return (
+                Verdict::Dismiss,
+                format!("the analyzer missed a real call rather than finding dead code ({conf:.2})"),
+            );
+        }
+    }
     if api >= cfg.api_at {
-        // Weakening a finding already at the Info floor changes nothing
-        // observable, and public symbols in library mode are exactly the
-        // population that arrives there. Dismiss is the only lever with an
-        // effect on them. Where the engine was certain, the step down is
-        // real and Weaken is the proportionate action.
+        // Severity has no step below Info, and public symbols in library
+        // mode are exactly the population that arrives there, so Weaken
+        // would leave severity untouched. Dismiss drops confidence to
+        // Unknown, which the display threshold reads. Above the floor the
+        // step down is real and Weaken is the proportionate action.
         return if engine.0 <= Severity::Info {
             (
                 Verdict::Dismiss,
@@ -266,14 +298,6 @@ fn decide(
                 format!("public API surface for outside consumers ({api:.2})"),
             )
         };
-    }
-    if let Some(("resolver_limitation", conf)) = explanation {
-        if conf >= cfg.explanation_at {
-            return (
-                Verdict::Dismiss,
-                format!("the analyzer missed a real call rather than finding dead code ({conf:.2})"),
-            );
-        }
     }
     if fw < cfg.low_at
         && test < cfg.low_at
@@ -424,10 +448,11 @@ impl Judge for DeadCodeJudge {
                 "explanation".to_string(),
                 Question::choice(
                     "A static analyzer found no call to the function in `function` anywhere \
-                     in this repository. Analyzers miss calls they cannot resolve, so this \
-                     may be a limit of the analysis rather than a fact about the code. \
-                     Given `occurrences`, `in_test_context`, and `engine_confidence`, what \
-                     best explains the absence of a detected call?",
+                     in this repository. `occurrences` lists where the name appears \
+                     elsewhere, so a real call site there would mean the analyzer failed to \
+                     resolve it rather than that the code is dead. Given `occurrences`, \
+                     `in_test_context`, and `engine_confidence`, what best explains the \
+                     absence of a detected call?",
                     [
                         ("framework_invoked", "A framework, container, or registry calls it without an explicit call site."),
                         ("test_support", "It exists to support tests."),
@@ -535,6 +560,10 @@ mod tests {
         assert_eq!(function_name("unused function `neverCalled`"), Some("neverCalled"));
         assert_eq!(function_name("possibly unused function `helper`"), Some("helper"));
         assert_eq!(function_name("no backticks here"), None);
+        assert_eq!(function_name("one backtick `here"), None);
+        // An empty pair is not a name. Some("") would put a nameless
+        // function in the state, indistinguishable from the absent case.
+        assert_eq!(function_name("unused function ``"), None);
     }
 
     #[test]
@@ -551,6 +580,26 @@ mod tests {
         );
         assert_eq!(s["in_test_context"], false);
         assert_eq!(s["engine_confidence"], "likely");
+    }
+
+    /// F2: samples used to be the first eight by path order. On the real
+    /// repo that meant a common name's eight samples contained no call at
+    /// all, steering the resolver question to the answer that permits
+    /// Strengthen.
+    #[test]
+    fn sample_sites_put_call_like_lines_first() {
+        assert!(looks_like_call("    helper() + 1", "helper"));
+        assert!(looks_like_call("    self.helper()", "helper"));
+        assert!(looks_like_call("    crate::helper", "helper"));
+        assert!(!looks_like_call("    span: helper,", "helper"));
+        assert!(!looks_like_call("    // helper is gone", "helper"));
+
+        let s = DeadCodeJudge.state_for(&finding(), &ctx());
+        let samples = s["occurrences"]["sample_sites"].as_array().unwrap();
+        assert!(
+            samples[0].as_str().unwrap().contains("helper() + 1"),
+            "the call site must rank first, got {samples:?}"
+        );
     }
 
     #[test]

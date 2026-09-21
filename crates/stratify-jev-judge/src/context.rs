@@ -3,7 +3,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -116,18 +116,39 @@ impl RepoContext {
         let Some(hits) = index.as_ref().and_then(|m| m.get(name)) else {
             return Vec::new();
         };
-        hits.iter()
-            .filter_map(|(file_idx, line)| {
-                let rel = &self.files.get(*file_idx)?.rel;
-                let text = self.file_text(rel)?;
-                let content = text.lines().nth(line - 1)?.trim().to_string();
-                Some(Occurrence {
-                    file: rel.clone(),
-                    line: *line,
-                    text: content,
-                })
-            })
-            .collect()
+        // Group by file so each file's text is fetched and split once, not
+        // once per hit. A common identifier can appear hundreds of times in
+        // one file, and resolving each hit separately would clone the whole
+        // file every time, undoing what build_index exists to protect.
+        let mut by_file: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (file_idx, line) in hits {
+            by_file.entry(*file_idx).or_default().push(*line);
+        }
+        let mut out = Vec::new();
+        for (file_idx, mut lines) in by_file {
+            // The index holds one entry per token, so a line using the name
+            // twice yields two identical sites. Counting tokens and calling
+            // them sites would overstate the evidence.
+            lines.sort_unstable();
+            lines.dedup();
+            let Some(entry) = self.files.get(file_idx) else {
+                continue;
+            };
+            let Some(text) = self.file_text(&entry.rel) else {
+                continue;
+            };
+            let split: Vec<&str> = text.lines().collect();
+            for line in lines {
+                if let Some(content) = split.get(line - 1) {
+                    out.push(Occurrence {
+                        file: entry.rel.clone(),
+                        line,
+                        text: content.trim().to_string(),
+                    });
+                }
+            }
+        }
+        out
     }
 
     fn build_index(&self) {
@@ -165,14 +186,18 @@ impl RepoContext {
         let Some(text) = self.file_text(file) else {
             return false;
         };
+        let lines: Vec<&str> = text.lines().collect();
         let mut depth: i32 = 0;
         let mut test_depth: Option<i32> = None;
-        for (i, l) in text.lines().enumerate() {
+        for (i, l) in lines.iter().enumerate() {
             if i + 1 > line {
                 break;
             }
-            if test_depth.is_none() && opens_test_block(l) {
-                test_depth = Some(depth);
+            if test_depth.is_none() {
+                let following = lines[i + 1..].iter().find(|n| !n.trim().is_empty()).copied();
+                if opens_test_block(l, following) {
+                    test_depth = Some(depth);
+                }
             }
             for ch in l.chars() {
                 match ch {
@@ -237,15 +262,23 @@ pub struct Occurrence {
     pub text: String,
 }
 
-/// Call `f` with every identifier-like run in `line`. Bytes outside
-/// `[A-Za-z0-9_]` end a run, so a multi-byte character splits identifiers
-/// rather than joining them. Every slice boundary is an ASCII byte, so this
-/// cannot panic on non-ASCII source.
+/// Call `f` with every identifier-like run in `line`.
+///
+/// Bytes at or above 0x80 count as identifier bytes, so `créerUtilisateur`
+/// stays one identifier. Go, Python, Ruby, TypeScript and Java all permit
+/// non-ASCII identifiers, and splitting them would make `occurrences`
+/// return nothing for such a function, which the `no` criterion then reads
+/// as proof that no caller exists.
+///
+/// This cannot panic. A run ends at the first non-identifier byte, which is
+/// always ASCII and therefore a char boundary. A run starts at the first
+/// identifier byte after a non-identifier one, and a UTF-8 continuation
+/// byte never follows an ASCII byte, so a run never starts mid-character.
 fn for_each_identifier(line: &str, mut f: impl FnMut(&str)) {
     let bytes = line.as_bytes();
     let mut start: Option<usize> = None;
     for (i, &b) in bytes.iter().enumerate() {
-        let is_ident = b.is_ascii_alphanumeric() || b == b'_';
+        let is_ident = b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
         match (is_ident, start) {
             (true, None) => start = Some(i),
             (false, Some(st)) => {
@@ -273,15 +306,51 @@ fn path_is_tests(rel: &str) -> bool {
         || stem.contains(".spec.")
 }
 
-/// True when the line opens a block whose contents are tests.
-fn opens_test_block(line: &str) -> bool {
-    let t = line.trim_start();
-    t.starts_with("#[cfg(test)]")
-        || t.starts_with("mod tests")
-        || t.starts_with("pub mod tests")
-        || t.starts_with("describe(")
-        || t.starts_with("class Test")
-        || (t.starts_with("class ") && t.contains("Test") && t.ends_with(':'))
+/// True when `t` reaches an opening brace before any statement terminator.
+fn opens_a_block(t: &str) -> bool {
+    match (t.find('{'), t.find(';')) {
+        (Some(b), Some(semi)) => b < semi,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// True when `t` names a test module, as a whole word. Plain `starts_with`
+/// would also match `mod testsuite`, an ordinary production module.
+fn names_test_module(t: &str) -> bool {
+    ["mod tests", "pub mod tests"].iter().any(|p| {
+        t.strip_prefix(p).is_some_and(|rest| {
+            !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+        })
+    })
+}
+
+/// True when this line opens a block whose contents are tests. `following`
+/// is the next non-blank line, since `#[cfg(test)]` sits on its own line
+/// above the `mod` it applies to.
+///
+/// The opener must actually open a block. `#[cfg(test)] use tempfile::…;`,
+/// `mod tests;` and a Python class all name tests without opening a braced
+/// block, and arming on them leaves the flag set over the next function,
+/// which then reads as test code and gets dismissed. That is C1's failure
+/// mode reversed: silently deleting a real finding instead of real code.
+///
+/// Python is deliberately absent. Its blocks are indentation-delimited, so
+/// brace counting can never close them and the flag would stay armed for
+/// the rest of the file. `path_is_tests` covers the usual Python layouts
+/// (`test_*.py`, `*_test.py`, `tests/`) and is the safer instrument.
+fn opens_test_block(line: &str, following: Option<&str>) -> bool {
+    let t = line.trim();
+    // A bare `#[cfg(test)]` attribute never opens a block itself: the `mod`
+    // it applies to is the next line, so only this branch consults
+    // `following`. `mod tests;` and `describe(...)` are complete statements
+    // on their own line, and peeking past them would let an unrelated
+    // brace on the next, unconnected line arm the flag: `mod tests;`
+    // followed by a production function's own `{` measured exactly this.
+    if t.starts_with("#[cfg(test)]") {
+        return opens_a_block(t) || following.map(str::trim).is_some_and(opens_a_block);
+    }
+    (names_test_module(t) || t.starts_with("describe(")) && opens_a_block(t)
 }
 
 /// Largest char boundary at or below `i`. Index 0 is always a boundary, so
@@ -462,6 +531,77 @@ mod tests {
         // `fn prod` on line 1 and `fn after` on line 10 do not.
         assert!(!ctx.in_test_context("src/a.rs", 1));
         assert!(!ctx.in_test_context("src/a.rs", 10));
+    }
+
+    /// F1: an opener that names tests without opening a braced block left
+    /// the flag armed over the next function, which then read as test code
+    /// and got dismissed. That is the reverse of promoting live code: it
+    /// silently deletes a real finding.
+    #[test]
+    fn an_opener_that_opens_no_block_does_not_arm_test_context() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        for (name, body, probe) in [
+            (
+                "a.rs",
+                "#[cfg(test)]\nuse std::fmt::Debug;\n\npub fn production_thing() -> u32 {\n    1\n}\n",
+                4,
+            ),
+            ("b.rs", "mod tests;\n\npub fn important() -> u32 {\n    1\n}\n", 3),
+            ("c.rs", "mod testsuite;\n\npub fn thing() -> u32 {\n    1\n}\n", 3),
+        ] {
+            std::fs::write(dir.path().join("src").join(name), body).unwrap();
+            let ctx = RepoContext::new(dir.path().to_path_buf()).unwrap();
+            assert!(
+                !ctx.in_test_context(&format!("src/{name}"), probe),
+                "{name}: production code must not read as test context"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cfg_test_attribute_above_a_module_still_arms() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "#[cfg(test)]\nmod tests {\n    fn helper() {}\n}\n\npub fn after() {}\n",
+        )
+        .unwrap();
+        let ctx = RepoContext::new(dir.path().to_path_buf()).unwrap();
+        assert!(ctx.in_test_context("src/a.rs", 3), "the helper is inside the module");
+        assert!(!ctx.in_test_context("src/a.rs", 6), "after the module closes it is not");
+    }
+
+    #[test]
+    fn a_line_using_the_name_twice_counts_as_one_site() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "fn twice() -> u32 {\n    helper() + helper()\n}\nfn helper() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        let ctx = RepoContext::new(dir.path().to_path_buf()).unwrap();
+        let hits = ctx.occurrences("helper");
+        let lines: Vec<usize> = hits.iter().map(|o| o.line).collect();
+        assert_eq!(lines, vec![2, 4], "one site per line, not one per token");
+    }
+
+    #[test]
+    fn a_non_ascii_identifier_is_one_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/a.py"),
+            "def cr\u{e9}erUtilisateur():\n    pass\n\ncr\u{e9}erUtilisateur()\n",
+        )
+        .unwrap();
+        let ctx = RepoContext::new(dir.path().to_path_buf()).unwrap();
+        // Splitting on the accent would return nothing, and the resolver
+        // question's "no" criterion reads an empty list as proof of no caller.
+        assert_eq!(ctx.occurrences("cr\u{e9}erUtilisateur").len(), 2);
+        assert!(ctx.occurrences("erUtilisateur").is_empty());
     }
 
     #[test]

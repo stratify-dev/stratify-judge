@@ -114,6 +114,9 @@ mod tests {
         assert_eq!(c.batch_findings, 10);
         assert_eq!(c.thresholds.dead_code.dismiss_at, 0.75);
         assert_eq!(c.thresholds.dead_code.explanation_at, 0.70);
+        assert_eq!(c.thresholds.dead_code.api_at, 0.75);
+        assert_eq!(c.thresholds.dead_code.low_at, 0.25);
+        assert_eq!(c.thresholds.dead_code.resolver_at, 0.70);
     }
 
     #[test]
