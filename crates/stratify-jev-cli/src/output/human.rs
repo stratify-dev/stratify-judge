@@ -42,12 +42,16 @@ pub fn render(report: &Report, min: Confidence, show_dismissed: bool) -> String 
     }
 
     let total = report.findings.len();
-    let dismissed = total - shown;
+    // How many the display threshold hid, not how many the model judged
+    // Dismiss: those are different counts, and "dismissed" claiming the
+    // latter while computing the former read as 0 even when findings were
+    // genuinely dismissed, under --show-dismissed.
+    let hidden = total - shown;
     if !out.is_empty() {
         out.push('\n');
     }
-    out.push_str(&format!("{total} findings, {shown} shown, {dismissed} dismissed"));
-    if dismissed > 0 && !show_dismissed {
+    out.push_str(&format!("{total} findings, {shown} shown, {hidden} hidden"));
+    if hidden > 0 && !show_dismissed {
         out.push_str(". Re-run with --show-dismissed to see them");
     }
     out.push_str(".\n");
@@ -139,15 +143,19 @@ mod tests {
         assert!(visible(&dismissed, Confidence::Likely, true));
     }
 
+    /// M3: the count is how many findings the display threshold hid, not
+    /// how many the model judged Dismiss. "dismissed" claimed the latter
+    /// while computing the former, and read as 0 dismissed under
+    /// --show-dismissed even when findings were genuinely dismissed.
     #[test]
-    fn the_summary_names_shown_and_dismissed_counts() {
+    fn the_summary_names_shown_and_hidden_counts() {
         let r = report(vec![
             finding(Confidence::Unknown, true),
             finding(Confidence::Unknown, true),
             finding(Confidence::Likely, false),
         ]);
         let out = render(&r, Confidence::Likely, false);
-        assert!(out.contains("3 findings, 1 shown, 2 dismissed"), "got:\n{out}");
+        assert!(out.contains("3 findings, 1 shown, 2 hidden"), "got:\n{out}");
     }
 
     #[test]

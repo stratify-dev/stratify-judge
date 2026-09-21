@@ -11,13 +11,27 @@ pub fn render(report: &Report, tool_version: &str) -> String {
             serde_json::Value::String(format!("stratify-jev/{tool_version}")),
         );
     }
-    serde_json::to_string_pretty(&v).unwrap_or_default()
+    let mut body = serde_json::to_string_pretty(&v).unwrap_or_default();
+    body.push('\n');
+    body
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use stratify_jev_judge::model::{Confidence, Finding, Report, Severity, Span};
+
+    /// M4: the last byte must be a newline, or `diff`, line-oriented
+    /// tooling, and shell `$(...)` round-trips all break on the output.
+    #[test]
+    fn output_ends_with_a_trailing_newline() {
+        let r = Report {
+            schema_version: 1,
+            findings: vec![],
+            extra: serde_json::Map::new(),
+        };
+        assert!(render(&r, "0.1.0").ends_with('\n'), "got {:?}", render(&r, "0.1.0"));
+    }
 
     #[test]
     fn output_keeps_the_findings_shape_and_names_the_tool() {
