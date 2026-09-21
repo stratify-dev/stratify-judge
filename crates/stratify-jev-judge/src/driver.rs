@@ -22,6 +22,21 @@ pub struct RunStats {
     pub failed: usize,
     pub input_tokens: u64,
     pub by_verdict: BTreeMap<String, usize>,
+    /// Distinct error messages, first occurrence of each kept. A hundred
+    /// identical 401s must print once, not a hundred times.
+    pub errors: Vec<String>,
+    /// Findings lost to a failed request. `failed` counts batches; with
+    /// `batch_findings` above one, a single failed batch loses several
+    /// findings, and a message that only names `failed` reads as if it
+    /// means one finding per failure.
+    pub unjudged: usize,
+    /// Findings prepared for judging whose span names a file this run could
+    /// not read. A high count against `prepared` is the signature of a
+    /// `--root` that does not match the report it is judging.
+    pub missing_sources: usize,
+    /// Findings a registered judge claimed and attempted to prepare state
+    /// for, whether or not judging them succeeded.
+    pub prepared: usize,
 }
 
 /// Group item indices into batches that respect both the count cap and the
@@ -94,14 +109,16 @@ impl Driver {
         }
     }
 
-    /// How many requests a real run would send right now.
+    /// How many requests a real run would send right now, and the total
+    /// input tokens they would cost.
     ///
     /// Runs the same prepare and cache-split path as `run`, so a committed
     /// cache is reflected: a finding already answered costs nothing and is
     /// not counted. Sends nothing and needs no client, so `--dry-run` works
     /// without a key.
-    pub fn plan(&self, report: &Report, ctx: &RepoContext) -> usize {
+    pub fn plan(&self, report: &Report, ctx: &RepoContext) -> (usize, usize) {
         let mut requests = 0;
+        let mut tokens = 0;
         for judge in registry() {
             let questions = judge.questions();
             let mut misses: Vec<usize> = Vec::new();
@@ -121,6 +138,7 @@ impl Driver {
             if misses.is_empty() {
                 continue;
             }
+            tokens += misses.iter().sum::<usize>();
             requests += plan_batches(
                 misses.len(),
                 self.cfg.batch_findings,
@@ -129,7 +147,7 @@ impl Driver {
             )
             .len();
         }
-        requests
+        (requests, tokens)
     }
 
     /// Judge every finding a registered judge claims. Findings the model
@@ -150,6 +168,10 @@ impl Driver {
             for (index, f) in report.findings.iter().enumerate() {
                 if f.rule != judge.rule() {
                     continue;
+                }
+                stats.prepared += 1;
+                if ctx.file_text(&f.span.file).is_none() {
+                    stats.missing_sources += 1;
                 }
                 let state = judge.state_for(f, ctx);
                 let key = cache_key(
@@ -236,8 +258,13 @@ impl Driver {
             for (batch, result) in results {
                 let resp = match result {
                     Ok(r) => r,
-                    Err(_) => {
+                    Err(e) => {
                         stats.failed += 1;
+                        stats.unjudged += batch.len();
+                        let msg = e.to_string();
+                        if !stats.errors.contains(&msg) {
+                            stats.errors.push(msg);
+                        }
                         continue;
                     }
                 };
@@ -411,10 +438,13 @@ mod tests {
             ..JevConfig::default()
         };
         let d = Driver::new(None, Cache::new(dir.path().into(), true), cfg);
-        // Five dead_code findings at two per batch is three requests.
-        assert_eq!(d.plan(&report(5), &ctx()), 3);
+        // Five dead_code findings at two per batch is three requests, and
+        // the token estimate is the sum of all five slots' costs.
+        let (requests, tokens) = d.plan(&report(5), &ctx());
+        assert_eq!(requests, 3);
+        assert!(tokens > 0, "a real request costs real tokens");
         // A report with nothing this judge claims costs nothing.
-        assert_eq!(d.plan(&report(0), &ctx()), 0);
+        assert_eq!(d.plan(&report(0), &ctx()), (0, 0));
     }
 
     #[tokio::test]
@@ -442,15 +472,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = || Cache::new(dir.path().into(), true);
 
-        // Before anything is cached the plan is one request.
-        assert_eq!(
-            Driver::new(None, cache(), JevConfig::default()).plan(&report(1), &ctx()),
-            1
-        );
+        // Before anything is cached the plan is one request, at a nonzero
+        // token cost.
+        let (requests, tokens) =
+            Driver::new(None, cache(), JevConfig::default()).plan(&report(1), &ctx());
+        assert_eq!(requests, 1);
+        assert!(tokens > 0);
 
-        // Answer it for real, then the plan is zero. This is the steady
-        // state the README recommends, and a plan that ignored the cache
-        // would still say one.
+        // Answer it for real, then the plan is zero requests and zero
+        // tokens. This is the steady state the README recommends, and a
+        // plan that ignored the cache would still say one.
         let d = Driver::new(
             Some(Client::new(server.uri(), "k".into())),
             cache(),
@@ -460,7 +491,7 @@ mod tests {
 
         assert_eq!(
             Driver::new(None, cache(), JevConfig::default()).plan(&report(1), &ctx()),
-            0
+            (0, 0)
         );
     }
 
@@ -728,6 +759,108 @@ mod tests {
             .count();
         assert_eq!(changed, 1, "one finding judged");
         assert_eq!(identical, 1, "the other byte-identical to input");
+    }
+
+    /// C1: `stats.failed` alone told the user nothing about *why*, so a
+    /// typo'd key and a timeout printed the identical message. The driver
+    /// must carry the error text into `RunStats`, and must count the
+    /// findings the batch lost, not just the batch itself.
+    #[tokio::test]
+    async fn a_401_surfaces_the_auth_error_and_counts_its_findings_as_unjudged() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = JevConfig {
+            batch_findings: 10,
+            ..JevConfig::default()
+        };
+        let d = Driver::new(
+            Some(Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+            })),
+            Cache::new(dir.path().into(), false),
+            cfg,
+        );
+
+        let mut r = report(3);
+        let stats = d.run(&mut r, &ctx()).await;
+
+        assert_eq!(stats.failed, 1, "one batch failed");
+        assert_eq!(stats.unjudged, 3, "all three findings in that batch went unjudged");
+        assert_eq!(stats.errors, vec!["invalid or missing API key".to_string()]);
+    }
+
+    /// A hundred identical errors must not print a hundred lines: only the
+    /// first occurrence of each distinct message is kept.
+    #[tokio::test]
+    async fn repeated_identical_errors_are_recorded_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = JevConfig {
+            batch_findings: 1,
+            ..JevConfig::default()
+        };
+        let d = Driver::new(
+            Some(Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+            })),
+            Cache::new(dir.path().into(), false),
+            cfg,
+        );
+
+        let mut r = report(4);
+        let stats = d.run(&mut r, &ctx()).await;
+
+        assert_eq!(stats.failed, 4, "four batches, all failing");
+        assert_eq!(stats.unjudged, 4);
+        assert_eq!(stats.errors.len(), 1, "the same message must not repeat");
+    }
+
+    #[tokio::test]
+    async fn missing_sources_are_counted_when_the_root_does_not_match_the_report() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "jev-1.13.0",
+                "answers": {
+                    "s0__framework_invoked": { "noul": 0.5 },
+                    "s0__test_only": { "noul": 0.5 },
+                    "s0__external_api": { "noul": 0.5 },
+                    "s0__resolver_missed_a_call": { "noul": 0.5 },
+                    "s0__explanation": {
+                        "choice": "cannot_tell",
+                        "probabilities": {},
+                        "confidence": 0.5
+                    }
+                },
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = report(1);
+        r.findings[0].span.file = "no/such/file.rs".into();
+
+        let d = Driver::new(
+            Some(Client::new(server.uri(), "k".into())),
+            Cache::new(dir.path().into(), false),
+            JevConfig::default(),
+        );
+        let stats = d.run(&mut r, &ctx()).await;
+        assert_eq!(stats.missing_sources, 1);
+        assert_eq!(stats.prepared, 1);
     }
 
     #[tokio::test]
