@@ -502,56 +502,43 @@ mod tests {
         assert_eq!(second.findings[0].confidence, Confidence::Unknown);
     }
 
-    /// I3: a response missing one of the judge's five canonical keys is
-    /// still applied (a missing answer just means Keep), but must never be
-    /// cached. A cached partial body would be replayed forever with no way
-    /// back except a version bump that discards every other entry too.
-    /// `.expect(2)` on the mock is the check: caching the partial answer
-    /// would serve the second run from disk and this mock would only see
-    /// one request.
+    /// Pins the completeness gate. Without it the partial set below would
+    /// be written under the full question set's key, and every later run
+    /// would replay an empty judgment from a cache that is meant to be
+    /// committed to git, never asking again.
     #[tokio::test]
     async fn a_partial_answer_set_is_applied_but_never_cached() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "model": "jev-1.13.0",
-                "answers": {
-                    "s0__framework_invoked": { "noul": 0.95 },
-                    "s0__test_only": { "noul": 0.01 },
-                    "s0__external_api": { "noul": 0.02 },
-                    "s0__explanation": {
-                        "choice": "framework_invoked",
-                        "probabilities": {},
-                        "confidence": 0.9
-                    }
-                    // resolver_missed_a_call is intentionally absent: one
-                    // of dead_code's five canonical keys is missing.
-                },
-                "usage": { "input_tokens": 300, "output_tokens": 0 }
+                // One of dead_code's five canonical answers.
+                "answers": { "s0__test_only": { "noul": 0.01 } },
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
             })))
             .expect(2)
             .mount(&server)
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig::default();
         let make = || {
             Driver::new(
                 Some(Client::new(server.uri(), "k".into())),
                 Cache::new(dir.path().into(), true),
-                cfg.clone(),
+                JevConfig::default(),
             )
         };
 
         let mut first = report(1);
-        let s1 = make().run(&mut first, &ctx()).await;
-        assert_eq!(s1.requested, 1);
-        assert_eq!(s1.judged, 1, "a partial answer set is still applied");
+        let first_stats = make().run(&mut first, &ctx()).await;
+        assert_eq!(first_stats.requested, 1);
+        // decide refuses to act on a missing answer, so applying is safe.
+        assert_eq!(first.findings[0].extra["judgment"]["verdict"], "keep");
 
         let mut second = report(1);
-        let s2 = make().run(&mut second, &ctx()).await;
-        assert_eq!(s2.from_cache, 0, "a partial answer set must never be served from cache");
-        assert_eq!(s2.requested, 1, "the second run must ask again");
+        let stats = make().run(&mut second, &ctx()).await;
+        assert_eq!(stats.from_cache, 0, "a partial set must not be cached");
+        assert_eq!(stats.requested, 1, "so the second run asks again");
     }
 
     /// Two findings, one batch each, one request succeeding and one
