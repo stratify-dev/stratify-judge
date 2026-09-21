@@ -53,10 +53,17 @@ pub fn plan_batches(
     out
 }
 
-/// Rough token estimate. Four characters per token is close enough to
-/// keep a batch under the state ceiling with headroom to spare.
-fn estimate_tokens(state: &serde_json::Value) -> usize {
-    serde_json::to_string(state).map(|s| s.len() / 4).unwrap_or(0)
+/// Rough token estimate for one slot: its state plus one copy of the
+/// question set, at four characters per token.
+///
+/// The questions have to count. The driver sends the whole set once per
+/// slot, so a ten-slot batch ships ten copies. For dead_code that is
+/// roughly 4 KB each, about 10k tokens a state-only estimate never sees,
+/// which would put a batch measured at 23k well past the real limit.
+fn estimate_tokens(state: &serde_json::Value, questions: &BTreeMap<String, Question>) -> usize {
+    let state_len = serde_json::to_string(state).map(|s| s.len()).unwrap_or(0);
+    let question_len = serde_json::to_string(questions).map(|s| s.len()).unwrap_or(0);
+    (state_len + question_len) / 4
 }
 
 fn slot_prefix(i: usize) -> String {
@@ -114,7 +121,7 @@ impl Driver {
                     &state,
                     &questions,
                 );
-                let tokens = estimate_tokens(&state);
+                let tokens = estimate_tokens(&state, &questions);
                 prepared.push(Prepared { index, state, key, tokens });
             }
             if prepared.is_empty() {
@@ -158,9 +165,19 @@ impl Driver {
                 let mut state = serde_json::Map::new();
                 let mut qs: BTreeMap<String, Question> = BTreeMap::new();
                 for (slot, &mi) in batch.iter().enumerate() {
-                    state.insert(format!("finding_{slot}"), misses[mi].state.clone());
+                    let root = format!("finding_{slot}");
+                    state.insert(root.clone(), misses[mi].state.clone());
                     for (name, q) in &questions {
-                        qs.insert(format!("{}{}", slot_prefix(slot), name), q.clone());
+                        // Both halves matter. The name prefix routes the
+                        // answer back to this slot; rendering the root into
+                        // the instructions is what tells the model which of
+                        // the batch's findings the question is about. With
+                        // only the prefix, every slot sends byte-identical
+                        // text and the binding exists nowhere on the wire.
+                        qs.insert(
+                            format!("{}{}", slot_prefix(slot), name),
+                            q.with_state_root(&root),
+                        );
                     }
                 }
                 let req = SystemOneRequest {
@@ -203,14 +220,24 @@ impl Driver {
                     if answers.is_empty() {
                         continue;
                     }
-                    let _ = self.cache.put(
-                        &misses[mi].key,
-                        judge.rule(),
-                        judge.version(),
-                        &resp.model,
-                        &answers,
-                        resp.usage,
-                    );
+                    // Apply a partial answer set, but never persist one.
+                    // `decide` already refuses to act on missing answers, so
+                    // applying is harmless. Storing is not: the cache is
+                    // meant to be committed, so a truncated body would be
+                    // replayed forever and the finding never asked about
+                    // again, escapable only by a version bump that discards
+                    // every other entry too.
+                    let complete = questions.keys().all(|k| answers.contains_key(k));
+                    if complete {
+                        let _ = self.cache.put(
+                            &misses[mi].key,
+                            judge.rule(),
+                            judge.version(),
+                            &resp.model,
+                            &answers,
+                            resp.usage,
+                        );
+                    }
                     self.apply_one(
                         report,
                         misses[mi].index,
@@ -254,10 +281,13 @@ impl Driver {
             Verdict::Keep => "keep",
             Verdict::Strengthen => "strengthen",
         };
-        *stats.by_verdict.entry(label.to_string()).or_insert(0) += 1;
-        stats.judged += 1;
+        // Count only what was written. Counting first allows a shape where
+        // `run` reports a judgment it never applied, and the CLI summary
+        // then prints a number with nothing behind it.
         if let Some(f) = report.findings.get_mut(index) {
             apply(f, &judgment, judge.full_strength());
+            *stats.by_verdict.entry(label.to_string()).or_insert(0) += 1;
+            stats.judged += 1;
         }
     }
 }
@@ -318,6 +348,17 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_batch_size_still_makes_progress() {
+        // `.max(1)` is load-bearing: without it `cur.len() >= 0` is true on
+        // the first iteration, so an empty batch is pushed and becomes a
+        // request with an empty state and no questions. JevConfig applies no
+        // validation, so batch_findings = 0 in a user's stratify.toml
+        // reaches this directly.
+        assert_eq!(plan_batches(3, 0, &[10, 10, 10], 24_000), vec![vec![0], vec![1], vec![2]]);
+        assert!(plan_batches(0, 10, &[], 24_000).is_empty());
+    }
+
+    #[test]
     fn a_single_oversized_item_still_gets_its_own_batch() {
         let est = vec![90_000];
         let b = plan_batches(1, 10, &est, 24_000);
@@ -371,6 +412,52 @@ mod tests {
         assert_eq!(r.findings[0].extra["judgment"]["model"], "jev-1.13.0");
     }
 
+    /// The send side. Every other async test hard-codes `s0__` in the mock
+    /// response, so they prove the strip works and say nothing about what
+    /// went out. With one finding per batch a send/strip mismatch is
+    /// invisible, and so is a question that names no slot at all.
+    #[tokio::test]
+    async fn a_batch_binds_each_question_to_its_own_finding() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "jev-1.13.0",
+                "answers": {},
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let d = Driver::new(
+            Some(Client::new(server.uri(), "k".into())),
+            Cache::new(dir.path().into(), false),
+            JevConfig::default(),
+        );
+        let mut r = report(2);
+        d.run(&mut r, &ctx()).await;
+
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1, "two findings fit one batch");
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+
+        assert!(body["state"]["finding_0"].is_object());
+        assert!(body["state"]["finding_1"].is_object());
+
+        let q0 = body["questions"]["s0__framework_invoked"]["instructions"]
+            .as_str()
+            .expect("slot 0 question present");
+        let q1 = body["questions"]["s1__framework_invoked"]["instructions"]
+            .as_str()
+            .expect("slot 1 question present");
+
+        assert!(q0.contains("finding_0."), "slot 0 must name its own state: {q0}");
+        assert!(q1.contains("finding_1."), "slot 1 must name its own state: {q1}");
+        assert!(!q0.contains("finding_1."), "slot 0 must not name slot 1: {q0}");
+        assert!(!q0.contains("{root}"), "the placeholder must be rendered: {q0}");
+        assert_ne!(q0, q1, "identical text for two slots binds neither");
+    }
+
     #[tokio::test]
     async fn a_second_run_is_served_entirely_from_cache() {
         let server = MockServer::start().await;
@@ -381,6 +468,7 @@ mod tests {
                     "s0__framework_invoked": { "noul": 0.95 },
                     "s0__test_only": { "noul": 0.01 },
                     "s0__external_api": { "noul": 0.02 },
+                    "s0__resolver_missed_a_call": { "noul": 0.03 },
                     "s0__explanation": {
                         "choice": "framework_invoked",
                         "probabilities": {},
@@ -412,6 +500,75 @@ mod tests {
         assert_eq!(stats.requested, 0);
         assert_eq!(stats.from_cache, 1);
         assert_eq!(second.findings[0].confidence, Confidence::Unknown);
+    }
+
+    /// Two findings, one batch each, one request succeeding and one
+    /// failing. The existing single-batch test proves "the request failed",
+    /// not "a failed batch leaves its peers alone", which is the reason
+    /// `failed` exists as its own counter.
+    #[tokio::test]
+    async fn one_failing_batch_does_not_disturb_a_succeeding_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "jev-1.13.0",
+                "answers": {
+                    "s0__framework_invoked": { "noul": 0.95 },
+                    "s0__test_only": { "noul": 0.01 },
+                    "s0__external_api": { "noul": 0.02 },
+                    "s0__resolver_missed_a_call": { "noul": 0.03 },
+                    "s0__explanation": {
+                        "choice": "framework_invoked",
+                        "probabilities": {},
+                        "confidence": 0.9
+                    }
+                },
+                "usage": { "input_tokens": 300, "output_tokens": 0 }
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = JevConfig {
+            batch_findings: 1,
+            ..JevConfig::default()
+        };
+        let d = Driver::new(
+            Some(Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+            })),
+            Cache::new(dir.path().into(), false),
+            cfg,
+        );
+
+        let mut r = report(2);
+        let before = r.clone();
+        let stats = d.run(&mut r, &ctx()).await;
+
+        assert_eq!(stats.failed, 1, "exactly one batch failed");
+        assert_eq!(stats.judged, 1, "the other still applied");
+
+        // The two tasks race, so assert on the pair rather than on which
+        // index got which outcome.
+        let changed = r
+            .findings
+            .iter()
+            .filter(|f| f.extra.contains_key("judgment"))
+            .count();
+        let identical = r
+            .findings
+            .iter()
+            .zip(before.findings.iter())
+            .filter(|(a, b)| a == b)
+            .count();
+        assert_eq!(changed, 1, "one finding judged");
+        assert_eq!(identical, 1, "the other byte-identical to input");
     }
 
     #[tokio::test]

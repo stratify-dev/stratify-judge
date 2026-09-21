@@ -338,11 +338,12 @@ impl Judge for DeadCodeJudge {
     }
 
     fn version(&self) -> u32 {
-        // 2: state gained occurrences, in_test_context and engine_confidence,
-        // and the question set gained resolver_missed_a_call. Every cached
-        // answer from version 1 was produced without that evidence, so the
-        // bump must invalidate them.
-        2
+        // 3: question text now names its state root (`{root}.function`), so
+        // every question in a batch binds to the finding it is about, and
+        // test_only finally references in_test_context. A version-2 answer
+        // was produced from text naming a bare key that is not present at
+        // the top level of a batched request.
+        3
     }
 
     fn full_strength(&self) -> Severity {
@@ -388,7 +389,8 @@ impl Judge for DeadCodeJudge {
                 Question::noul(
                     "Would a framework, dependency-injection container, reflection call, \
                      route table, serializer, or plugin registry invoke the function in \
-                     `function` without any explicit call to it appearing in source?",
+                     `{root}.function` without any explicit call to it appearing in \
+                     source?",
                     Some(NoulCriteria {
                         yes: "Something outside ordinary call syntax reaches this function: \
                               an annotation or attribute registers it, a container wires it, \
@@ -402,8 +404,9 @@ impl Judge for DeadCodeJudge {
             (
                 "test_only".to_string(),
                 Question::noul(
-                    "Does the function in `function` exist only to support tests, such as a \
-                     fixture builder, a test helper, or an assertion utility?",
+                    "Given `{root}.in_test_context`, does the function in `{root}.function` \
+                     exist only to support tests, such as a fixture builder, a test \
+                     helper, or an assertion utility?",
                     Some(NoulCriteria {
                         yes: "Its purpose is setting up or supporting tests, and production \
                               code has no reason to call it.".into(),
@@ -414,8 +417,9 @@ impl Judge for DeadCodeJudge {
             (
                 "external_api".to_string(),
                 Question::noul(
-                    "Is the function in `function` part of a public API surface intended for \
-                     consumers outside this repository, given `project_markers`?",
+                    "Is the function in `{root}.function` part of a public API surface \
+                     intended for consumers outside this repository, given \
+                     `{root}.project_markers`?",
                     Some(NoulCriteria {
                         yes: "It is exported for other codebases to call, and no caller inside \
                               this repository is expected.".into(),
@@ -429,7 +433,8 @@ impl Judge for DeadCodeJudge {
                 Question::noul(
                     "The engine that produced this finding resolves calls statically and \
                      cannot follow every one, particularly across crate, package, or module \
-                     boundaries. Given `occurrences`, which lists where this name appears \
+                     boundaries. Given `{root}.occurrences`, which lists where this name \
+                     appears \
                      elsewhere in the repository, does a real call site exist that the \
                      engine failed to connect to this function?",
                     Some(NoulCriteria {
@@ -447,11 +452,13 @@ impl Judge for DeadCodeJudge {
             (
                 "explanation".to_string(),
                 Question::choice(
-                    "A static analyzer found no call to the function in `function` anywhere \
-                     in this repository. `occurrences` lists where the name appears \
+                    "A static analyzer found no call to the function in `{root}.function` \
+                     anywhere in this repository. `{root}.occurrences` lists where the \
+                     name appears \
                      elsewhere, so a real call site there would mean the analyzer failed to \
-                     resolve it rather than that the code is dead. Given `occurrences`, \
-                     `in_test_context`, and `engine_confidence`, what best explains the \
+                     resolve it rather than that the code is dead. Given \
+                     `{root}.occurrences`, `{root}.in_test_context`, and \
+                     `{root}.engine_confidence`, what best explains the \
                      absence of a detected call?",
                     [
                         ("framework_invoked", "A framework, container, or registry calls it without an explicit call site."),
@@ -651,6 +658,25 @@ mod tests {
         let ctx = ctx();
         let line = line_of(&ctx, "src/app.py", "def untouched");
         assert!(attributes_above(&ctx, "src/app.py", line).is_empty());
+    }
+
+    /// Every question must name its state root. Without the placeholder, a
+    /// batched request sends byte-identical text for every slot and nothing
+    /// on the wire says which finding a question is about.
+    #[test]
+    fn every_question_references_its_state_root() {
+        for (name, q) in DeadCodeJudge.questions() {
+            let v = serde_json::to_value(&q).unwrap();
+            let text = v["instructions"].as_str().unwrap();
+            assert!(
+                text.contains("{root}."),
+                "question `{name}` names no state root: {text}"
+            );
+            assert!(
+                !text.contains("`function`"),
+                "question `{name}` still names a bare state key: {text}"
+            );
+        }
     }
 
     #[test]

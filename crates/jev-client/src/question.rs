@@ -34,6 +34,59 @@ pub enum Question {
 }
 
 impl Question {
+    /// Replace every `{root}` placeholder in this question's instructions
+    /// with `root`, returning the rendered question.
+    ///
+    /// A batched request puts each finding's state under its own key
+    /// (`finding_0`, `finding_1`, ...) and namespaces question names by
+    /// slot. Without this, every slot's questions would carry byte-identical
+    /// text referring to a bare state key that does not exist at the top
+    /// level, and nothing on the wire would bind a question to the finding
+    /// it is about. The model would receive N indistinguishable copies of
+    /// one question against N candidates.
+    ///
+    /// Criteria are deliberately not rendered: they describe what counts as
+    /// an answer, never where the evidence lives.
+    pub fn with_state_root(&self, root: &str) -> Question {
+        fn render(v: &serde_json::Value, root: &str) -> serde_json::Value {
+            match v {
+                serde_json::Value::String(t) => {
+                    serde_json::Value::String(t.replace("{root}", root))
+                }
+                serde_json::Value::Array(items) => {
+                    serde_json::Value::Array(items.iter().map(|i| render(i, root)).collect())
+                }
+                serde_json::Value::Object(map) => serde_json::Value::Object(
+                    map.iter().map(|(k, i)| (k.clone(), render(i, root))).collect(),
+                ),
+                other => other.clone(),
+            }
+        }
+        match self {
+            Question::Noul {
+                instructions,
+                criteria,
+            } => Question::Noul {
+                instructions: render(instructions, root),
+                criteria: criteria.clone(),
+            },
+            Question::Choice {
+                instructions,
+                criteria,
+            } => Question::Choice {
+                instructions: render(instructions, root),
+                criteria: criteria.clone(),
+            },
+            Question::Score {
+                instructions,
+                criteria,
+            } => Question::Score {
+                instructions: render(instructions, root),
+                criteria: criteria.clone(),
+            },
+        }
+    }
+
     pub fn noul(instructions: impl Into<String>, criteria: Option<NoulCriteria>) -> Question {
         Question::Noul {
             instructions: serde_json::Value::String(instructions.into()),
@@ -121,6 +174,32 @@ mod tests {
         let v = serde_json::to_value(&q).unwrap();
         assert_eq!(v["criteria"][0], "Level 0");
         assert_eq!(v["criteria"][2], "Level 2");
+    }
+
+    #[test]
+    fn with_state_root_renders_the_placeholder_in_instructions_only() {
+        let q = Question::noul(
+            "Would a framework invoke `{root}.function`, given `{root}.occurrences`?",
+            Some(NoulCriteria {
+                yes: "Something outside ordinary call syntax reaches it.".into(),
+                no: "Only an ordinary call would reach it.".into(),
+            }),
+        );
+        let v = serde_json::to_value(q.with_state_root("finding_3")).unwrap();
+        let text = v["instructions"].as_str().unwrap();
+        assert!(text.contains("finding_3.function"), "got {text}");
+        assert!(text.contains("finding_3.occurrences"), "got {text}");
+        assert!(!text.contains("{root}"), "placeholder must be gone: {text}");
+        // Criteria say what counts as an answer, not where evidence lives.
+        assert_eq!(v["criteria"]["true"], "Something outside ordinary call syntax reaches it.");
+    }
+
+    #[test]
+    fn with_state_root_leaves_a_question_without_the_placeholder_alone() {
+        let q = Question::choice("Why?", [("a", "A"), ("cannot_tell", "Unclear")]);
+        let before = serde_json::to_value(&q).unwrap();
+        let after = serde_json::to_value(q.with_state_root("finding_0")).unwrap();
+        assert_eq!(before, after);
     }
 
     #[test]
