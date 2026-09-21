@@ -94,6 +94,44 @@ impl Driver {
         }
     }
 
+    /// How many requests a real run would send right now.
+    ///
+    /// Runs the same prepare and cache-split path as `run`, so a committed
+    /// cache is reflected: a finding already answered costs nothing and is
+    /// not counted. Sends nothing and needs no client, so `--dry-run` works
+    /// without a key.
+    pub fn plan(&self, report: &Report, ctx: &RepoContext) -> usize {
+        let mut requests = 0;
+        for judge in registry() {
+            let questions = judge.questions();
+            let mut misses: Vec<usize> = Vec::new();
+            for f in report.findings.iter().filter(|f| f.rule == judge.rule()) {
+                let state = judge.state_for(f, ctx);
+                let key = cache_key(
+                    judge.rule(),
+                    judge.version(),
+                    &self.cfg.model,
+                    &state,
+                    &questions,
+                );
+                if self.cache.get(&key).is_none() {
+                    misses.push(estimate_tokens(&state, &questions));
+                }
+            }
+            if misses.is_empty() {
+                continue;
+            }
+            requests += plan_batches(
+                misses.len(),
+                self.cfg.batch_findings,
+                &misses,
+                TOKEN_CEILING,
+            )
+            .len();
+        }
+        requests
+    }
+
     /// Judge every finding a registered judge claims. Findings the model
     /// never reaches, for any reason, are left exactly as the engine
     /// reported them.
@@ -363,6 +401,67 @@ mod tests {
         let est = vec![90_000];
         let b = plan_batches(1, 10, &est, 24_000);
         assert_eq!(b, vec![vec![0]]);
+    }
+
+    #[test]
+    fn plan_counts_batches_and_discounts_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = JevConfig {
+            batch_findings: 2,
+            ..JevConfig::default()
+        };
+        let d = Driver::new(None, Cache::new(dir.path().into(), true), cfg);
+        // Five dead_code findings at two per batch is three requests.
+        assert_eq!(d.plan(&report(5), &ctx()), 3);
+        // A report with nothing this judge claims costs nothing.
+        assert_eq!(d.plan(&report(0), &ctx()), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cached_finding_is_not_counted_in_the_plan() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "jev-1.13.0",
+                "answers": {
+                    "s0__framework_invoked": { "noul": 0.95 },
+                    "s0__test_only": { "noul": 0.01 },
+                    "s0__external_api": { "noul": 0.02 },
+                    "s0__resolver_missed_a_call": { "noul": 0.03 },
+                    "s0__explanation": {
+                        "choice": "framework_invoked",
+                        "probabilities": {},
+                        "confidence": 0.9
+                    }
+                },
+                "usage": { "input_tokens": 300, "output_tokens": 0 }
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = || Cache::new(dir.path().into(), true);
+
+        // Before anything is cached the plan is one request.
+        assert_eq!(
+            Driver::new(None, cache(), JevConfig::default()).plan(&report(1), &ctx()),
+            1
+        );
+
+        // Answer it for real, then the plan is zero. This is the steady
+        // state the README recommends, and a plan that ignored the cache
+        // would still say one.
+        let d = Driver::new(
+            Some(Client::new(server.uri(), "k".into())),
+            cache(),
+            JevConfig::default(),
+        );
+        d.run(&mut report(1), &ctx()).await;
+
+        assert_eq!(
+            Driver::new(None, cache(), JevConfig::default()).plan(&report(1), &ctx()),
+            0
+        );
     }
 
     #[tokio::test]
