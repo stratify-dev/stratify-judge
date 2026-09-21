@@ -509,6 +509,9 @@ mod tests {
     /// `.expect(2)` on the mock is the check: caching the partial answer
     /// would serve the second run from disk and this mock would only see
     /// one request.
+    ///
+    /// Four of five rather than one of five, because a model skipping a
+    /// single question is the realistic shape of this failure.
     #[tokio::test]
     async fn a_partial_answer_set_is_applied_but_never_cached() {
         let server = MockServer::start().await;
@@ -534,24 +537,29 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig::default();
         let make = || {
             Driver::new(
                 Some(Client::new(server.uri(), "k".into())),
                 Cache::new(dir.path().into(), true),
-                cfg.clone(),
+                JevConfig::default(),
             )
         };
 
         let mut first = report(1);
         let s1 = make().run(&mut first, &ctx()).await;
         assert_eq!(s1.requested, 1);
-        assert_eq!(s1.judged, 1, "a partial answer set is still applied");
+        assert_eq!(s1.judged, 1, "a partial set is still applied");
+        // resolver_missed_a_call is the only missing key; decide's
+        // early-return-to-Keep only fires when framework_invoked, test_only
+        // or external_api is missing, and all three are present here. The
+        // other four keys still drive a normal decision: framework_invoked
+        // at 0.95 legitimately dismisses.
+        assert_eq!(first.findings[0].extra["judgment"]["verdict"], "dismiss");
 
         let mut second = report(1);
-        let s2 = make().run(&mut second, &ctx()).await;
-        assert_eq!(s2.from_cache, 0, "a partial answer set must never be served from cache");
-        assert_eq!(s2.requested, 1, "the second run must ask again");
+        let stats = make().run(&mut second, &ctx()).await;
+        assert_eq!(stats.from_cache, 0, "a partial set must not be cached");
+        assert_eq!(stats.requested, 1, "so the second run asks again");
     }
 
     /// Two findings, one batch each, one request succeeding and one
