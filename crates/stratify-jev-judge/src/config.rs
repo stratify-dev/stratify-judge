@@ -1,15 +1,33 @@
 use serde::Deserialize;
 use std::path::Path;
 
-fn d_model() -> String { "jev-latest".to_string() }
-fn d_concurrency() -> usize { 8 }
-fn d_batch_findings() -> usize { 10 }
-fn d_batch_files() -> usize { 25 }
-fn d_dismiss_at() -> f64 { 0.75 }
-fn d_api_at() -> f64 { 0.75 }
-fn d_low_at() -> f64 { 0.25 }
-fn d_explanation_at() -> f64 { 0.70 }
-fn d_resolver_at() -> f64 { 0.70 }
+fn d_model() -> String {
+    "jev-latest".to_string()
+}
+fn d_concurrency() -> usize {
+    8
+}
+fn d_batch_findings() -> usize {
+    10
+}
+fn d_batch_files() -> usize {
+    25
+}
+fn d_dismiss_at() -> f64 {
+    0.75
+}
+fn d_api_at() -> f64 {
+    0.75
+}
+fn d_low_at() -> f64 {
+    0.25
+}
+fn d_explanation_at() -> f64 {
+    0.70
+}
+fn d_resolver_at() -> f64 {
+    0.70
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeadCodeThresholds {
@@ -148,7 +166,11 @@ dismiss_at = 0.9
     fn stratify_jev_toml_overrides_stratify_toml() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("stratify.toml"), "[jev]\nconcurrency = 3\n").unwrap();
-        std::fs::write(dir.path().join("stratify-jev.toml"), "[jev]\nconcurrency = 16\n").unwrap();
+        std::fs::write(
+            dir.path().join("stratify-jev.toml"),
+            "[jev]\nconcurrency = 16\n",
+        )
+        .unwrap();
         assert_eq!(JevConfig::load(dir.path()).concurrency, 16);
     }
 

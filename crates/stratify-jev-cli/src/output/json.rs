@@ -30,7 +30,11 @@ mod tests {
             findings: vec![],
             extra: serde_json::Map::new(),
         };
-        assert!(render(&r, "0.1.0").ends_with('\n'), "got {:?}", render(&r, "0.1.0"));
+        assert!(
+            render(&r, "0.1.0").ends_with('\n'),
+            "got {:?}",
+            render(&r, "0.1.0")
+        );
     }
 
     #[test]
@@ -96,7 +100,13 @@ mod tests {
         assert_eq!(v["findings"].as_array().unwrap().len(), 1, "never dropped");
         assert_eq!(v["findings"][0]["confidence"], "unknown");
         assert_eq!(v["findings"][0]["judgment"]["verdict"], "dismiss");
-        assert_eq!(v["findings"][0]["judgment"]["answers"]["framework_invoked"], 0.91);
-        assert_eq!(v["findings"][0]["judgment"]["original"]["severity"], "warning");
+        assert_eq!(
+            v["findings"][0]["judgment"]["answers"]["framework_invoked"],
+            0.91
+        );
+        assert_eq!(
+            v["findings"][0]["judgment"]["original"]["severity"],
+            "warning"
+        );
     }
 }

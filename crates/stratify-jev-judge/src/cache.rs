@@ -139,12 +139,27 @@ mod tests {
         let base = cache_key("dead_code", 1, "jev-latest", &s, &questions());
         // A different judge must never collide with this one. Two judges
         // sharing a key would serve one judge's verdict to the other.
-        assert_ne!(base, cache_key("duplication", 1, "jev-latest", &s, &questions()));
-        assert_ne!(base, cache_key("dead_code", 2, "jev-latest", &s, &questions()));
-        assert_ne!(base, cache_key("dead_code", 1, "jev-1.13.0", &s, &questions()));
         assert_ne!(
             base,
-            cache_key("dead_code", 1, "jev-latest", &json!({ "name": "other" }), &questions())
+            cache_key("duplication", 1, "jev-latest", &s, &questions())
+        );
+        assert_ne!(
+            base,
+            cache_key("dead_code", 2, "jev-latest", &s, &questions())
+        );
+        assert_ne!(
+            base,
+            cache_key("dead_code", 1, "jev-1.13.0", &s, &questions())
+        );
+        assert_ne!(
+            base,
+            cache_key(
+                "dead_code",
+                1,
+                "jev-latest",
+                &json!({ "name": "other" }),
+                &questions()
+            )
         );
         let mut q2 = questions();
         q2.insert("test_only".into(), Question::noul("q2", None));
@@ -158,8 +173,18 @@ mod tests {
         let key = "a".repeat(64);
         assert!(c.get(&key).is_none());
 
-        c.put(&key, "dead_code", 1, "jev-1.13.0", &answers(), Usage { input_tokens: 10, output_tokens: 0 })
-            .unwrap();
+        c.put(
+            &key,
+            "dead_code",
+            1,
+            "jev-1.13.0",
+            &answers(),
+            Usage {
+                input_tokens: 10,
+                output_tokens: 0,
+            },
+        )
+        .unwrap();
 
         let got = c.get(&key).unwrap();
         assert_eq!(got.model, "jev-1.13.0");
@@ -171,8 +196,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = Cache::new(dir.path().to_path_buf(), false);
         let key = "b".repeat(64);
-        c.put(&key, "dead_code", 1, "jev-1.13.0", &answers(), Usage { input_tokens: 10, output_tokens: 0 })
-            .unwrap();
+        c.put(
+            &key,
+            "dead_code",
+            1,
+            "jev-1.13.0",
+            &answers(),
+            Usage {
+                input_tokens: 10,
+                output_tokens: 0,
+            },
+        )
+        .unwrap();
         assert!(c.get(&key).is_none());
         assert!(!dir.path().join("bb").exists());
     }
@@ -183,7 +218,11 @@ mod tests {
         let c = Cache::new(dir.path().to_path_buf(), true);
         let key = "c".repeat(64);
         std::fs::create_dir_all(dir.path().join("cc")).unwrap();
-        std::fs::write(dir.path().join("cc").join(format!("{key}.json")), "{ not json").unwrap();
+        std::fs::write(
+            dir.path().join("cc").join(format!("{key}.json")),
+            "{ not json",
+        )
+        .unwrap();
         assert!(c.get(&key).is_none());
     }
 }

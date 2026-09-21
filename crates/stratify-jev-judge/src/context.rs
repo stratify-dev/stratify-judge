@@ -194,7 +194,10 @@ impl RepoContext {
                 break;
             }
             if test_depth.is_none() {
-                let following = lines[i + 1..].iter().find(|n| !n.trim().is_empty()).copied();
+                let following = lines[i + 1..]
+                    .iter()
+                    .find(|n| !n.trim().is_empty())
+                    .copied();
                 if opens_test_block(l, following) {
                     test_depth = Some(depth);
                 }
@@ -225,7 +228,9 @@ impl RepoContext {
             return hit.clone();
         }
         let read = std::fs::read_to_string(self.root.join(rel)).ok();
-        self.cache.borrow_mut().insert(rel.to_string(), read.clone());
+        self.cache
+            .borrow_mut()
+            .insert(rel.to_string(), read.clone());
         read
     }
 
@@ -319,9 +324,8 @@ fn opens_a_block(t: &str) -> bool {
 /// would also match `mod testsuite`, an ordinary production module.
 fn names_test_module(t: &str) -> bool {
     ["mod tests", "pub mod tests"].iter().any(|p| {
-        t.strip_prefix(p).is_some_and(|rest| {
-            !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')
-        })
+        t.strip_prefix(p)
+            .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
     })
 }
 
@@ -404,8 +408,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture() -> RepoContext {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/sample-repo");
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/sample-repo");
         RepoContext::new(root).unwrap()
     }
 
@@ -456,14 +460,19 @@ mod tests {
         // 'h' is one byte, then 'é' occupies the next two, so find + 2
         // lands strictly inside 'é' and is not a char boundary.
         let inside = text.find("héllo").unwrap() + 2;
-        assert!(!text.is_char_boundary(inside), "fixture must be multi-byte here");
+        assert!(
+            !text.is_char_boundary(inside),
+            "fixture must be multi-byte here"
+        );
         let span = Span {
             file: "src/unicode.rs".into(),
             start_byte: inside,
             end_byte: inside + 1,
             start_line: 1,
         };
-        let src = ctx.function_source(&span).expect("returns a line, never panics");
+        let src = ctx
+            .function_source(&span)
+            .expect("returns a line, never panics");
         assert!(src.contains("héllo"), "got {src:?}");
     }
 
@@ -500,7 +509,9 @@ mod tests {
 
     #[test]
     fn occurrences_are_empty_for_an_unknown_name() {
-        assert!(fixture().occurrences("no_such_identifier_anywhere").is_empty());
+        assert!(fixture()
+            .occurrences("no_such_identifier_anywhere")
+            .is_empty());
     }
 
     #[test]
@@ -569,8 +580,14 @@ mod tests {
         )
         .unwrap();
         let ctx = RepoContext::new(dir.path().to_path_buf()).unwrap();
-        assert!(ctx.in_test_context("src/a.rs", 3), "the helper is inside the module");
-        assert!(!ctx.in_test_context("src/a.rs", 6), "after the module closes it is not");
+        assert!(
+            ctx.in_test_context("src/a.rs", 3),
+            "the helper is inside the module"
+        );
+        assert!(
+            !ctx.in_test_context("src/a.rs", 6),
+            "after the module closes it is not"
+        );
     }
 
     #[test]

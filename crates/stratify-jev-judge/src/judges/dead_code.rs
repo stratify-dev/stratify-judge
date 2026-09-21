@@ -241,7 +241,10 @@ fn decide(
 ) -> (Verdict, String) {
     // A missing answer never produces an action. Absence is not evidence.
     let (Some(fw), Some(test), Some(api)) = (fw, test, api) else {
-        return (Verdict::Keep, "no usable answer, left as the engine found it".into());
+        return (
+            Verdict::Keep,
+            "no usable answer, left as the engine found it".into(),
+        );
     };
     // An absent resolver answer is unknown, not low and not high. It must
     // not trigger Dismiss, or a model that omits the answer would dismiss
@@ -257,7 +260,10 @@ fn decide(
     }
 
     if fw >= cfg.dismiss_at {
-        return (Verdict::Dismiss, format!("reached by a framework ({fw:.2})"));
+        return (
+            Verdict::Dismiss,
+            format!("reached by a framework ({fw:.2})"),
+        );
     }
     if test >= cfg.dismiss_at {
         return (Verdict::Dismiss, format!("test-only helper ({test:.2})"));
@@ -277,7 +283,9 @@ fn decide(
         if conf >= cfg.explanation_at {
             return (
                 Verdict::Dismiss,
-                format!("the analyzer missed a real call rather than finding dead code ({conf:.2})"),
+                format!(
+                    "the analyzer missed a real call rather than finding dead code ({conf:.2})"
+                ),
             );
         }
     }
@@ -497,8 +505,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn ctx() -> RepoContext {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/sample-repo");
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/sample-repo");
         RepoContext::new(root).unwrap()
     }
 
@@ -564,8 +572,14 @@ mod tests {
 
     #[test]
     fn extracts_the_function_name_from_either_message_form() {
-        assert_eq!(function_name("unused function `neverCalled`"), Some("neverCalled"));
-        assert_eq!(function_name("possibly unused function `helper`"), Some("helper"));
+        assert_eq!(
+            function_name("unused function `neverCalled`"),
+            Some("neverCalled")
+        );
+        assert_eq!(
+            function_name("possibly unused function `helper`"),
+            Some("helper")
+        );
         assert_eq!(function_name("no backticks here"), None);
         assert_eq!(function_name("one backtick `here"), None);
         // An empty pair is not a name. Some("") would put a nameless
@@ -582,7 +596,9 @@ mod tests {
         assert!(s["occurrences"]["repo_wide"].as_u64().unwrap() >= 1);
         let samples = s["occurrences"]["sample_sites"].as_array().unwrap();
         assert!(
-            samples.iter().any(|v| v.as_str().unwrap().contains("helper() + 1")),
+            samples
+                .iter()
+                .any(|v| v.as_str().unwrap().contains("helper() + 1")),
             "got {samples:?}"
         );
         assert_eq!(s["in_test_context"], false);
@@ -616,8 +632,12 @@ mod tests {
         assert_eq!(s["function"]["language"], "rust");
         assert_eq!(s["function"]["file"], "src/lib.rs");
         assert!(
-            s["function"]["source"].as_str().unwrap().contains("fn helper"),
-            "got {}", s["function"]["source"]
+            s["function"]["source"]
+                .as_str()
+                .unwrap()
+                .contains("fn helper"),
+            "got {}",
+            s["function"]["source"]
         );
     }
 
@@ -698,14 +718,22 @@ mod tests {
 
     #[test]
     fn a_confident_framework_hit_dismisses() {
-        let j = DeadCodeJudge.judge(&finding(), &answers(0.91, 0.02, 0.1, 0.05, "framework_invoked", 0.9), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(
+            &finding(),
+            &answers(0.91, 0.02, 0.1, 0.05, "framework_invoked", 0.9),
+            &DeadCodeThresholds::default(),
+        );
         assert_eq!(j.verdict, Verdict::Dismiss);
         assert!(j.reason.contains("framework"), "got {}", j.reason);
     }
 
     #[test]
     fn a_confident_test_helper_dismisses() {
-        let j = DeadCodeJudge.judge(&finding(), &answers(0.05, 0.88, 0.1, 0.05, "test_support", 0.9), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(
+            &finding(),
+            &answers(0.05, 0.88, 0.1, 0.05, "test_support", 0.9),
+            &DeadCodeThresholds::default(),
+        );
         assert_eq!(j.verdict, Verdict::Dismiss);
         assert!(j.reason.contains("test"), "got {}", j.reason);
     }
@@ -724,7 +752,11 @@ mod tests {
 
     #[test]
     fn low_signals_with_an_unsure_explanation_keeps() {
-        let j = DeadCodeJudge.judge(&finding(), &answers(0.04, 0.03, 0.05, 0.02, "genuinely_unused", 0.4), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(
+            &finding(),
+            &answers(0.04, 0.03, 0.05, 0.02, "genuinely_unused", 0.4),
+            &DeadCodeThresholds::default(),
+        );
         assert_eq!(j.verdict, Verdict::Keep);
     }
 
@@ -751,7 +783,11 @@ mod tests {
             &DeadCodeThresholds::default(),
         );
         assert_eq!(j.verdict, Verdict::Keep);
-        assert!(j.reason.contains("engine could not confirm"), "got {}", j.reason);
+        assert!(
+            j.reason.contains("engine could not confirm"),
+            "got {}",
+            j.reason
+        );
     }
 
     #[test]
@@ -770,7 +806,10 @@ mod tests {
         let a = answers(0.05, 0.05, 0.9, 0.05, "public_api", 0.9);
         // Already at Info: Weaken would write back identical values, so the
         // only lever with an observable effect is Dismiss.
-        assert_eq!(DeadCodeJudge.judge(&finding(), &a, &cfg).verdict, Verdict::Dismiss);
+        assert_eq!(
+            DeadCodeJudge.judge(&finding(), &a, &cfg).verdict,
+            Verdict::Dismiss
+        );
         // At Warning/Certain the step down is real.
         assert_eq!(
             DeadCodeJudge.judge(&certain_finding(), &a, &cfg).verdict,
@@ -783,7 +822,10 @@ mod tests {
         // Pins >= against >. Nothing else in the suite distinguishes them.
         let cfg = DeadCodeThresholds::default();
         let at = answers(cfg.dismiss_at, 0.0, 0.0, 0.0, "cannot_tell", 0.0);
-        assert_eq!(DeadCodeJudge.judge(&finding(), &at, &cfg).verdict, Verdict::Dismiss);
+        assert_eq!(
+            DeadCodeJudge.judge(&finding(), &at, &cfg).verdict,
+            Verdict::Dismiss
+        );
         let just_below = answers(cfg.dismiss_at - 0.001, 0.0, 0.0, 0.0, "cannot_tell", 0.0);
         assert_ne!(
             DeadCodeJudge.judge(&finding(), &just_below, &cfg).verdict,
@@ -818,7 +860,11 @@ mod tests {
 
     #[test]
     fn a_middling_answer_keeps() {
-        let j = DeadCodeJudge.judge(&finding(), &answers(0.5, 0.4, 0.3, 0.3, "cannot_tell", 0.4), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(
+            &finding(),
+            &answers(0.5, 0.4, 0.3, 0.3, "cannot_tell", 0.4),
+            &DeadCodeThresholds::default(),
+        );
         assert_eq!(j.verdict, Verdict::Keep);
     }
 
@@ -830,7 +876,11 @@ mod tests {
 
     #[test]
     fn every_raw_probability_is_recorded_on_the_judgment() {
-        let j = DeadCodeJudge.judge(&finding(), &answers(0.91, 0.02, 0.1, 0.05, "framework_invoked", 0.9), &DeadCodeThresholds::default());
+        let j = DeadCodeJudge.judge(
+            &finding(),
+            &answers(0.91, 0.02, 0.1, 0.05, "framework_invoked", 0.9),
+            &DeadCodeThresholds::default(),
+        );
         assert_eq!(j.answers["framework_invoked"], 0.91);
         assert_eq!(j.answers["explanation"]["choice"], "framework_invoked");
     }

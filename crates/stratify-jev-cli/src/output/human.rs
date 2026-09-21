@@ -118,7 +118,10 @@ mod tests {
     fn a_judged_finding_prints_its_reason_underneath() {
         let r = report(vec![finding(Confidence::Likely, true)]);
         let out = render(&r, Confidence::Unknown, false);
-        assert!(out.contains("jev: reached by a framework (0.91)"), "got:\n{out}");
+        assert!(
+            out.contains("jev: reached by a framework (0.91)"),
+            "got:\n{out}"
+        );
     }
 
     /// The behavior the whole product exists for: a finding the model

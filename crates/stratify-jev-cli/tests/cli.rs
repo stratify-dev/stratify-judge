@@ -72,7 +72,11 @@ fn an_unreadable_root_still_passes_the_report_through() {
 
     let body = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["findings"].as_array().unwrap().len(), 2, "the report still goes out");
+    assert_eq!(
+        v["findings"].as_array().unwrap().len(),
+        2,
+        "the report still goes out"
+    );
 }
 
 #[test]

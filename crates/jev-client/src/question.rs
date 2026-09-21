@@ -57,7 +57,9 @@ impl Question {
                     serde_json::Value::Array(items.iter().map(|i| render(i, root)).collect())
                 }
                 serde_json::Value::Object(map) => serde_json::Value::Object(
-                    map.iter().map(|(k, i)| (k.clone(), render(i, root))).collect(),
+                    map.iter()
+                        .map(|(k, i)| (k.clone(), render(i, root)))
+                        .collect(),
                 ),
                 other => other.clone(),
             }
@@ -146,7 +148,10 @@ mod tests {
         );
         let v = serde_json::to_value(&q).unwrap();
         assert_eq!(v["type"], "noul");
-        assert_eq!(v["criteria"]["true"], "A framework, container, or route table invokes it.");
+        assert_eq!(
+            v["criteria"]["true"],
+            "A framework, container, or route table invokes it."
+        );
     }
 
     #[test]
@@ -160,17 +165,25 @@ mod tests {
     fn choice_keeps_its_option_keys() {
         let q = Question::choice(
             "Why does nothing call it?",
-            [("genuinely_unused", "No caller exists anywhere."),
-             ("cannot_tell", "The evidence does not settle it.")],
+            [
+                ("genuinely_unused", "No caller exists anywhere."),
+                ("cannot_tell", "The evidence does not settle it."),
+            ],
         );
         let v = serde_json::to_value(&q).unwrap();
         assert_eq!(v["type"], "choice");
-        assert_eq!(v["criteria"]["cannot_tell"], "The evidence does not settle it.");
+        assert_eq!(
+            v["criteria"]["cannot_tell"],
+            "The evidence does not settle it."
+        );
     }
 
     #[test]
     fn score_criteria_stay_ordered_low_to_high() {
-        let q = Question::score("How valuable is extraction?", ["Level 0", "Level 1", "Level 2"]);
+        let q = Question::score(
+            "How valuable is extraction?",
+            ["Level 0", "Level 1", "Level 2"],
+        );
         let v = serde_json::to_value(&q).unwrap();
         assert_eq!(v["criteria"][0], "Level 0");
         assert_eq!(v["criteria"][2], "Level 2");
@@ -191,7 +204,10 @@ mod tests {
         assert!(text.contains("finding_3.occurrences"), "got {text}");
         assert!(!text.contains("{root}"), "placeholder must be gone: {text}");
         // Criteria say what counts as an answer, not where evidence lives.
-        assert_eq!(v["criteria"]["true"], "Something outside ordinary call syntax reaches it.");
+        assert_eq!(
+            v["criteria"]["true"],
+            "Something outside ordinary call syntax reaches it."
+        );
     }
 
     #[test]

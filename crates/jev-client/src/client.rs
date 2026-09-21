@@ -292,8 +292,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = from_key(server.uri(), Some("test-key".into()))
-            .expect("a usable key builds a client");
+        let client =
+            from_key(server.uri(), Some("test-key".into())).expect("a usable key builds a client");
         let got = client.ask(&req()).await.unwrap();
         assert_eq!(got.model, "jev-1.13.0");
     }

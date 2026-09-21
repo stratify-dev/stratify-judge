@@ -77,7 +77,9 @@ pub fn plan_batches(
 /// which would put a batch measured at 23k well past the real limit.
 fn estimate_tokens(state: &serde_json::Value, questions: &BTreeMap<String, Question>) -> usize {
     let state_len = serde_json::to_string(state).map(|s| s.len()).unwrap_or(0);
-    let question_len = serde_json::to_string(questions).map(|s| s.len()).unwrap_or(0);
+    let question_len = serde_json::to_string(questions)
+        .map(|s| s.len())
+        .unwrap_or(0);
     (state_len + question_len) / 4
 }
 
@@ -182,7 +184,12 @@ impl Driver {
                     &questions,
                 );
                 let tokens = estimate_tokens(&state, &questions);
-                prepared.push(Prepared { index, state, key, tokens });
+                prepared.push(Prepared {
+                    index,
+                    state,
+                    key,
+                    tokens,
+                });
             }
             if prepared.is_empty() {
                 continue;
@@ -212,12 +219,7 @@ impl Driver {
 
             // Batch the misses and fire them concurrently.
             let est: Vec<usize> = misses.iter().map(|p| p.tokens).collect();
-            let batches = plan_batches(
-                misses.len(),
-                self.cfg.batch_findings,
-                &est,
-                TOKEN_CEILING,
-            );
+            let batches = plan_batches(misses.len(), self.cfg.batch_findings, &est, TOKEN_CEILING);
 
             let sem = Arc::new(tokio::sync::Semaphore::new(self.cfg.concurrency.max(1)));
             let mut tasks = Vec::new();
@@ -368,8 +370,8 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn ctx() -> RepoContext {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/sample-repo");
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/sample-repo");
         RepoContext::new(root).unwrap()
     }
 
@@ -419,7 +421,10 @@ mod tests {
         // request with an empty state and no questions. JevConfig applies no
         // validation, so batch_findings = 0 in a user's stratify.toml
         // reaches this directly.
-        assert_eq!(plan_batches(3, 0, &[10, 10, 10], 24_000), vec![vec![0], vec![1], vec![2]]);
+        assert_eq!(
+            plan_batches(3, 0, &[10, 10, 10], 24_000),
+            vec![vec![0], vec![1], vec![2]]
+        );
         assert!(plan_batches(0, 10, &[], 24_000).is_empty());
     }
 
@@ -498,7 +503,11 @@ mod tests {
     #[tokio::test]
     async fn without_a_client_the_report_passes_through_untouched() {
         let dir = tempfile::tempdir().unwrap();
-        let d = Driver::new(None, Cache::new(dir.path().into(), true), JevConfig::default());
+        let d = Driver::new(
+            None,
+            Cache::new(dir.path().into(), true),
+            JevConfig::default(),
+        );
         let mut r = report(3);
         let before = r.clone();
         let stats = d.run(&mut r, &ctx()).await;
@@ -530,7 +539,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let client = Client::new(server.uri(), "k".into());
-        let d = Driver::new(Some(client), Cache::new(dir.path().into(), true), JevConfig::default());
+        let d = Driver::new(
+            Some(client),
+            Cache::new(dir.path().into(), true),
+            JevConfig::default(),
+        );
 
         let mut r = report(1);
         let stats = d.run(&mut r, &ctx()).await;
@@ -581,10 +594,22 @@ mod tests {
             .as_str()
             .expect("slot 1 question present");
 
-        assert!(q0.contains("finding_0."), "slot 0 must name its own state: {q0}");
-        assert!(q1.contains("finding_1."), "slot 1 must name its own state: {q1}");
-        assert!(!q0.contains("finding_1."), "slot 0 must not name slot 1: {q0}");
-        assert!(!q0.contains("{root}"), "the placeholder must be rendered: {q0}");
+        assert!(
+            q0.contains("finding_0."),
+            "slot 0 must name its own state: {q0}"
+        );
+        assert!(
+            q1.contains("finding_1."),
+            "slot 1 must name its own state: {q1}"
+        );
+        assert!(
+            !q0.contains("finding_1."),
+            "slot 0 must not name slot 1: {q0}"
+        );
+        assert!(
+            !q0.contains("{root}"),
+            "the placeholder must be rendered: {q0}"
+        );
         assert_ne!(q0, q1, "identical text for two slots binds neither");
     }
 
@@ -729,10 +754,12 @@ mod tests {
             ..JevConfig::default()
         };
         let d = Driver::new(
-            Some(Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
-                max_attempts: 1,
-                base_delay: std::time::Duration::from_millis(1),
-            })),
+            Some(
+                Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                }),
+            ),
             Cache::new(dir.path().into(), false),
             cfg,
         );
@@ -779,10 +806,12 @@ mod tests {
             ..JevConfig::default()
         };
         let d = Driver::new(
-            Some(Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
-                max_attempts: 1,
-                base_delay: std::time::Duration::from_millis(1),
-            })),
+            Some(
+                Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                }),
+            ),
             Cache::new(dir.path().into(), false),
             cfg,
         );
@@ -791,7 +820,10 @@ mod tests {
         let stats = d.run(&mut r, &ctx()).await;
 
         assert_eq!(stats.failed, 1, "one batch failed");
-        assert_eq!(stats.unjudged, 3, "all three findings in that batch went unjudged");
+        assert_eq!(
+            stats.unjudged, 3,
+            "all three findings in that batch went unjudged"
+        );
         assert_eq!(stats.errors, vec!["invalid or missing API key".to_string()]);
     }
 
@@ -811,10 +843,12 @@ mod tests {
             ..JevConfig::default()
         };
         let d = Driver::new(
-            Some(Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
-                max_attempts: 1,
-                base_delay: std::time::Duration::from_millis(1),
-            })),
+            Some(
+                Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                }),
+            ),
             Cache::new(dir.path().into(), false),
             cfg,
         );
@@ -877,10 +911,12 @@ mod tests {
             ..JevConfig::default()
         };
         let d = Driver::new(
-            Some(Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
-                max_attempts: 2,
-                base_delay: std::time::Duration::from_millis(1),
-            })),
+            Some(
+                Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                    max_attempts: 2,
+                    base_delay: std::time::Duration::from_millis(1),
+                }),
+            ),
             Cache::new(dir.path().into(), true),
             cfg,
         );
