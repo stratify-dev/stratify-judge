@@ -45,14 +45,44 @@ mod tests {
         assert_eq!(v["findings"][0]["confidence"], "unknown");
     }
 
+    /// The auditability guarantee. A dismissed finding leaves human output
+    /// but must stay in the JSON with its judgment intact, or the model can
+    /// hide something with no trace.
     #[test]
-    fn dismissed_findings_are_never_dropped_from_json() {
+    fn a_dismissed_finding_survives_in_json_with_its_judgment() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "judgment".into(),
+            serde_json::json!({
+                "verdict": "dismiss",
+                "reason": "reached by a framework (0.91)",
+                "answers": { "framework_invoked": 0.91 },
+                "original": { "severity": "warning", "confidence": "certain" }
+            }),
+        );
         let r = Report {
             schema_version: 1,
-            findings: vec![],
+            findings: vec![Finding {
+                rule: "dead_code".into(),
+                severity: Severity::Info,
+                message: "possibly unused function `helper`".into(),
+                span: Span {
+                    file: "src/a.rs".into(),
+                    start_byte: 0,
+                    end_byte: 1,
+                    start_line: 6,
+                },
+                // Dismissed: below the default display threshold.
+                confidence: Confidence::Unknown,
+                extra,
+            }],
             extra: serde_json::Map::new(),
         };
         let v: serde_json::Value = serde_json::from_str(&render(&r, "0.1.0")).unwrap();
-        assert!(v["findings"].is_array());
+        assert_eq!(v["findings"].as_array().unwrap().len(), 1, "never dropped");
+        assert_eq!(v["findings"][0]["confidence"], "unknown");
+        assert_eq!(v["findings"][0]["judgment"]["verdict"], "dismiss");
+        assert_eq!(v["findings"][0]["judgment"]["answers"]["framework_invoked"], 0.91);
+        assert_eq!(v["findings"][0]["judgment"]["original"]["severity"], "warning");
     }
 }

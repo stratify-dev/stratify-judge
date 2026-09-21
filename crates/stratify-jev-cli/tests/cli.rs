@@ -26,8 +26,47 @@ fn without_an_api_key_the_report_passes_through_and_exits_zero() {
 
     let body = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["findings"].as_array().unwrap().len(), 2);
+    let input: serde_json::Value = serde_json::from_str(&report_json()).unwrap();
+    // Byte-identical, not merely the right count: a pass-through that
+    // corrupted a severity or a span would otherwise slip through.
+    assert_eq!(v["findings"], input["findings"], "untouched");
     assert!(v["findings"][0].get("judgment").is_none());
+}
+
+/// A root we cannot read stops judgment, not the report. Verified against
+/// the guarantee rather than against the exit code alone: an earlier
+/// version printed a clean error and exit 2, which looks correct until you
+/// notice stdout is empty and --fail-on never still failed.
+#[test]
+fn an_unreadable_root_still_passes_the_report_through() {
+    let out = Command::cargo_bin("stratify-jev")
+        .unwrap()
+        .env_remove("TYPESAFE_API_KEY")
+        .args(["--root", "/no/such/directory/anywhere", "--format", "json"])
+        .write_stdin(report_json())
+        .assert()
+        .success();
+
+    let body = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["findings"].as_array().unwrap().len(), 2, "the report still goes out");
+}
+
+#[test]
+fn an_unreadable_root_respects_fail_on_never() {
+    Command::cargo_bin("stratify-jev")
+        .unwrap()
+        .env_remove("TYPESAFE_API_KEY")
+        .args([
+            "--root",
+            "/no/such/directory/anywhere",
+            "--fail-on",
+            "never",
+        ])
+        .write_stdin(report_json())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("nothing was judged"));
 }
 
 #[test]

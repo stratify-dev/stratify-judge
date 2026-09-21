@@ -117,17 +117,33 @@ async fn main() -> ExitCode {
         return exit_code(&args, &report);
     }
 
+    // A root we cannot read means judgment cannot run. It does not mean the
+    // engine's findings stop being valid, so the report still goes out and
+    // --fail-on still gates on it, exactly like the missing-key path. Doing
+    // otherwise would let a misconfigured checkout path hard-fail a build
+    // that asked for --fail-on never, and would hand a downstream SARIF
+    // converter an empty pipe.
     let ctx = match RepoContext::new(args.root.clone()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("stratify-jev: cannot read {}: {e}", args.root.display());
-            return ExitCode::from(2);
+            eprintln!(
+                "stratify-jev: cannot read {}: {e}. Passing the report through \
+                 unchanged, nothing was judged",
+                args.root.display()
+            );
+            print!("{}", render(&args, &report));
+            return exit_code(&args, &report);
         }
     };
     let cfg = JevConfig::load(&args.root);
+    let cache = Cache::new(args.root.join(&args.cache_dir), !args.no_cache);
 
     if args.dry_run {
-        let planned = plan_only(&report, &cfg);
+        // Counted through the same prepare-and-cache-split path a real run
+        // takes, so a committed cache is reflected. A preview that ignores
+        // the cache overstates cost in exactly the steady state the README
+        // recommends.
+        let planned = Driver::new(None, cache, cfg).plan(&report, &ctx);
         println!("{planned} request(s) planned, nothing sent.");
         return ExitCode::SUCCESS;
     }
@@ -139,7 +155,6 @@ async fn main() -> ExitCode {
             );
         }
         Some(client) => {
-            let cache = Cache::new(args.root.join(&args.cache_dir), !args.no_cache);
             let driver = Driver::new(Some(client), cache, cfg);
             let stats = driver.run(&mut report, &ctx).await;
             if args.verbose {
@@ -163,19 +178,6 @@ async fn main() -> ExitCode {
 
     print!("{}", render(&args, &report));
     exit_code(&args, &report)
-}
-
-/// Count the requests a real run would send, without building a client.
-fn plan_only(report: &Report, cfg: &JevConfig) -> usize {
-    let claimed = report
-        .findings
-        .iter()
-        .filter(|f| f.rule == "dead_code")
-        .count();
-    if claimed == 0 {
-        return 0;
-    }
-    claimed.div_ceil(cfg.batch_findings.max(1))
 }
 
 fn render(args: &Args, report: &Report) -> String {

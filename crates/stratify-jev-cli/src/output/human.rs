@@ -117,6 +117,28 @@ mod tests {
         assert!(out.contains("jev: reached by a framework (0.91)"), "got:\n{out}");
     }
 
+    /// The behavior the whole product exists for: a finding the model
+    /// dismissed must not fail a build, even at a severity that otherwise
+    /// would. Only confidence separates it from one that should.
+    #[test]
+    fn visibility_is_what_separates_a_dismissed_warning_from_a_live_one() {
+        let dismissed = Finding {
+            severity: Severity::Warning,
+            confidence: Confidence::Unknown,
+            ..finding(Confidence::Unknown, true)
+        };
+        let live = Finding {
+            severity: Severity::Warning,
+            confidence: Confidence::Certain,
+            ..finding(Confidence::Certain, false)
+        };
+        // Same severity, opposite outcomes, decided by confidence alone.
+        assert!(!visible(&dismissed, Confidence::Likely, false));
+        assert!(visible(&live, Confidence::Likely, false));
+        // And --show-dismissed brings the dismissed one back into view.
+        assert!(visible(&dismissed, Confidence::Likely, true));
+    }
+
     #[test]
     fn the_summary_names_shown_and_dismissed_counts() {
         let r = report(vec![

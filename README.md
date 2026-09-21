@@ -38,6 +38,11 @@ a dependency of the scan.
 
 Run `stratify-jev --help`.
 
+`--dry-run` reports how many requests a real run would send and sends
+nothing. It counts through the same cache check a real run uses, so a
+committed cache shows as zero requests. It always exits 0, since it is a
+preview rather than a gate.
+
 ## Cache
 
 Answers cache under `.stratify/jev-cache/`, keyed on judge version, model,

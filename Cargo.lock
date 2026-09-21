@@ -1347,7 +1347,6 @@ dependencies = [
  "serde",
  "serde_json",
  "stratify-jev-judge",
- "tempfile",
  "tokio",
 ]
 
