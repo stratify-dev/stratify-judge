@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "findings": [
+    {
+      "rule": "dead_code",
+      "severity": "info",
+      "message": "possibly unused function `helper`",
+      "span": { "file": "src/lib.rs", "start_byte": 43, "end_byte": 72, "start_line": 5 },
+      "confidence": "likely"
+    },
+    {
+      "rule": "complexity",
+      "severity": "warning",
+      "message": "function `used` has cyclomatic complexity 12",
+      "span": { "file": "src/lib.rs", "start_byte": 0, "end_byte": 41, "start_line": 1 },
+      "confidence": "certain"
+    }
+  ]
+}
