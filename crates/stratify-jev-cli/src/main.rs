@@ -79,6 +79,11 @@ struct Args {
     #[arg(long, default_value = ".stratify/jev-cache")]
     cache_dir: PathBuf,
 
+    /// Override the API base URL, for pointing at a capture proxy or a
+    /// local mock when diagnosing a live run.
+    #[arg(long)]
+    base_url: Option<String>,
+
     #[arg(long)]
     verbose: bool,
 }
@@ -136,19 +141,26 @@ async fn main() -> ExitCode {
         }
     };
     let cfg = JevConfig::load(&args.root);
-    let cache = Cache::new(args.root.join(&args.cache_dir), !args.no_cache);
+    // Resolved against the current directory, not --root: the cache is this
+    // tool's own bookkeeping, and joining it onto --root would write
+    // untracked files into whatever repository is being analysed.
+    let cache = Cache::new(args.cache_dir.clone(), !args.no_cache);
 
     if args.dry_run {
         // Counted through the same prepare-and-cache-split path a real run
         // takes, so a committed cache is reflected. A preview that ignores
         // the cache overstates cost in exactly the steady state the README
         // recommends.
-        let planned = Driver::new(None, cache, cfg).plan(&report, &ctx);
-        println!("{planned} request(s) planned, nothing sent.");
+        let (planned, tokens) = Driver::new(None, cache, cfg).plan(&report, &ctx);
+        println!("{planned} request(s) planned, {tokens} tokens estimated, nothing sent.");
         return ExitCode::SUCCESS;
     }
 
-    match Client::from_env() {
+    let client = match &args.base_url {
+        Some(base) => Client::from_env_at(base.clone()),
+        None => Client::from_env(),
+    };
+    match client {
         None => {
             eprintln!(
                 "stratify-jev: TYPESAFE_API_KEY is not set, passing the report through unchanged"
@@ -167,11 +179,39 @@ async fn main() -> ExitCode {
                     stats.input_tokens
                 );
             }
+            // C2: a --root that exists but does not match the report being
+            // judged makes every span unreadable, which reads to the model
+            // as "no caller anywhere" and produces confident garbage. Warn
+            // before that garbage gets cached, without aborting: a repo
+            // with genuinely generated or moved files should still work.
+            if stats.prepared > 0 && stats.missing_sources * 2 > stats.prepared {
+                eprintln!(
+                    "stratify-jev: {} of {} findings name files that do not exist under {}; \
+                     is --root correct?",
+                    stats.missing_sources,
+                    stats.prepared,
+                    ctx.root().display()
+                );
+            }
+            // C1: every ClientError has a distinct, useful message; print
+            // requests, findings, and each one, instead of a bare count
+            // that makes a bad key indistinguishable from a timeout.
             if stats.failed > 0 {
                 eprintln!(
-                    "stratify-jev: {} request(s) failed, those findings are unchanged",
-                    stats.failed
+                    "stratify-jev: {} request(s) failed, {} finding(s) unjudged and left \
+                     unchanged",
+                    stats.failed, stats.unjudged
                 );
+                for e in &stats.errors {
+                    if e == "invalid or missing API key" {
+                        eprintln!(
+                            "stratify-jev: error: {e} (retrying will not help; check \
+                             TYPESAFE_API_KEY)"
+                        );
+                    } else {
+                        eprintln!("stratify-jev: error: {e}");
+                    }
+                }
             }
         }
     }
@@ -191,6 +231,11 @@ fn render(args: &Args, report: &Report) -> String {
 
 /// Exit code follows --fail-on over post-judgment findings, so the tool
 /// works as a gate without ever failing a build because TypeSafe was down.
+///
+/// Gates on severity and confidence directly, never on `show_dismissed`:
+/// that flag only changes what human output displays, and a CI job adding
+/// it for fuller logs must not start failing on findings the model
+/// dismissed.
 fn exit_code(args: &Args, report: &Report) -> ExitCode {
     let floor = match args.fail_on {
         FailOn::Never => return ExitCode::SUCCESS,
@@ -198,9 +243,11 @@ fn exit_code(args: &Args, report: &Report) -> ExitCode {
         FailOn::Warning => Severity::Warning,
         FailOn::Error => Severity::Error,
     };
-    let hit = report.findings.iter().any(|f| {
-        f.severity >= floor && output::human::visible(f, args.min_confidence.into(), args.show_dismissed)
-    });
+    let min_confidence: Confidence = args.min_confidence.into();
+    let hit = report
+        .findings
+        .iter()
+        .any(|f| f.severity >= floor && f.confidence >= min_confidence);
     if hit {
         ExitCode::from(1)
     } else {
