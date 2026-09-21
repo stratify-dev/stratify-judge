@@ -1,0 +1,17 @@
+[package]
+name = "stratify-jev-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "stratify-jev"
+path = "src/main.rs"
+
+[dependencies]
+stratify-jev-judge = { path = "../stratify-jev-judge" }
+jev-client = { path = "../jev-client" }
+serde.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
