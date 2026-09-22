@@ -4,10 +4,12 @@ Every ruling made while building this repo, in the order made, with what
 each costs if wrong. Preserved from the build session's working ledger,
 which lived outside version control.
 
-The plan and spec this argues from live in the engine repo:
+The plan and spec this argues from are not published. They live in a working
+copy of the engine repo as
 `docs/superpowers/specs/2026-09-20-stratify-jev-design.md` and
-`docs/superpowers/plans/2026-09-20-stratify-jev-p1-skeleton.md` in
-`stratify-dev/stratify`.
+`docs/superpowers/plans/2026-09-20-stratify-jev-p1-skeleton.md`. Rulings below
+that cite a task number or a brief refer to those files. The rulings themselves
+stand on their own: each says what was decided, why, and what it costs if wrong.
 
 ---
 
