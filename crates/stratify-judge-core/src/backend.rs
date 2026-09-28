@@ -108,6 +108,19 @@ impl BackendOverride {
     }
 }
 
+/// A default env var name for a config-only backend's key, derived from
+/// its table name. A dashed or otherwise non-shell-safe name, such as
+/// `my-laya`, would otherwise ask the user to set an env var no shell can
+/// name; every non-alphanumeric character becomes `_` so the result is
+/// always something `export` accepts.
+fn default_api_key_env(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("{}_API_KEY", sanitized.to_uppercase())
+}
+
 /// Resolve the backend to use: the preset named by `name`, overlaid with
 /// its config table, overlaid with the flags. A name with neither a preset
 /// nor a config entry is an error naming both places searched.
@@ -133,7 +146,7 @@ pub fn resolve_backend(
                 name: name.to_string(),
                 url: String::new(),
                 model: None,
-                api_key_env: format!("{}_API_KEY", name.to_uppercase()),
+                api_key_env: default_api_key_env(name),
                 api_key_required: false,
                 state_tokens: 0,
             };
@@ -292,6 +305,22 @@ state_tokens = 1024
         assert!(err.contains("mistral"), "got {err}");
         assert!(err.contains("preset"), "got {err}");
         assert!(err.contains("judge.backends.mistral"), "got {err}");
+    }
+
+    /// M7: a dashed or otherwise non-shell-safe backend name must not
+    /// derive an env var no shell can set. `export MY-LAYA_API_KEY=x` is a
+    /// syntax error in bash and zsh.
+    #[test]
+    fn a_dashed_backend_name_derives_a_shell_settable_env_var() {
+        let cfg: JudgeConfig = toml::from_str(
+            r#"
+[backends.my-laya]
+url = "http://10.0.0.5:8000"
+"#,
+        )
+        .unwrap();
+        let b = resolve_backend("my-laya", &cfg, None, None).unwrap();
+        assert_eq!(b.api_key_env, "MY_LAYA_API_KEY", "got {}", b.api_key_env);
     }
 
     #[test]
