@@ -59,7 +59,7 @@ cd ~/dev/stratify-jev
 cargo test 2>&1 | grep "^test result" | tee /tmp/baseline.txt
 ```
 
-Expected: four `ok` lines totalling 118 passed. Keep this file; Step 6 compares against it.
+Expected: six `test result: ok` lines, four carrying tests, 118 passed in total. Keep this file; Step 6 diffs against it. The diff is the check, not the count in this sentence.
 
 - [ ] **Step 2: Move the directories with git**
 
@@ -224,10 +224,12 @@ mod tests {
 
     #[test]
     fn config_overlays_the_preset_and_flags_overlay_config() {
+        // JudgeConfig is the inner type, so its own TOML carries no
+        // [judge] header. Production reads that header through the wrapper
+        // in JudgeConfig::load; these tests exercise the inner shape.
         let cfg: JudgeConfig = toml::from_str(
             r#"
-[judge]
-[judge.backends.laya]
+[backends.laya]
 state_tokens = 1024
 "#,
         )
@@ -266,8 +268,7 @@ state_tokens = 1024
     fn a_config_only_backend_needs_no_preset() {
         let cfg: JudgeConfig = toml::from_str(
             r#"
-[judge]
-[judge.backends.mine]
+[backends.mine]
 url = "http://10.0.0.5:8000"
 state_tokens = 4096
 api_key_env = "MINE_KEY"
@@ -568,12 +569,21 @@ Append to `crates/systemone-client/src/client.rs` tests:
     async fn a_client_without_a_key_sends_no_authorization_header() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(wiremock::matchers::header_exists("authorization").not())
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
             .mount(&server)
             .await;
         let c = Client::new(server.uri(), None);
         assert!(c.ask(&req()).await.is_ok(), "a local server with no auth is normal");
+
+        // wiremock 0.6 has no negation matcher, so assert on what was
+        // actually sent. An absent header and an empty bearer are
+        // different things on the wire, and only one of them is correct.
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].headers.get("authorization").is_none(),
+            "no key means no header at all"
+        );
     }
 
     #[tokio::test]
@@ -589,7 +599,7 @@ Append to `crates/systemone-client/src/client.rs` tests:
     }
 ```
 
-`wiremock::matchers::header_exists(..).not()` needs `use wiremock::matchers::header_exists;` and wiremock's `MatchExt` trait in scope: add `use wiremock::matchers::{header, header_exists, method};` and `use wiremock::MatchExt;`.
+The existing `use wiremock::matchers::{header, method};` covers both tests. Do not reach for a negation matcher: wiremock 0.6.5 has `header_exists` but no `not()` and no `Negate` matcher, which is why the first test inspects `received_requests()` instead.
 
 - [ ] **Step 3: Run to verify both fail**
 
