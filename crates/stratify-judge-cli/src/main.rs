@@ -4,13 +4,12 @@ use clap::{Parser, ValueEnum};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use stratify_judge_core::backend::Backend;
+use stratify_judge_core::backend::{client_for, resolve_backend};
 use stratify_judge_core::cache::Cache;
 use stratify_judge_core::config::JudgeConfig;
 use stratify_judge_core::context::RepoContext;
 use stratify_judge_core::driver::Driver;
 use stratify_judge_core::model::{Confidence, Report, Severity};
-use systemone_client::Client;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -45,7 +44,8 @@ enum FailOn {
     Error,
 }
 
-/// Judge a Stratify report with Jev. Reads the report on stdin.
+/// Judge a Stratify report with a System One model. Reads the report on
+/// stdin.
 #[derive(Parser)]
 #[command(name = "stratify-judge", version)]
 struct Args {
@@ -79,6 +79,15 @@ struct Args {
 
     #[arg(long, default_value = ".stratify/jev-cache")]
     cache_dir: PathBuf,
+
+    /// Which model endpoint to ask: a built-in preset (jev, laya) or a
+    /// name with a [judge.backends.<name>] table.
+    #[arg(long, default_value = "jev")]
+    backend: String,
+
+    /// Model id to send. Jev requires one; Laya ignores it.
+    #[arg(long)]
+    model: Option<String>,
 
     /// Override the API base URL, for pointing at a capture proxy or a
     /// local mock when diagnosing a live run.
@@ -147,14 +156,35 @@ async fn main() -> ExitCode {
     // untracked files into whatever repository is being analysed.
     let cache = Cache::new(args.cache_dir.clone(), !args.no_cache);
 
+    // An unresolvable backend is a configuration error discovered before
+    // anything is read from any model, unlike every other failure below,
+    // which passes the report through and lets --fail-on decide. So this
+    // one exits loudly instead of passing through.
+    let backend = match resolve_backend(
+        &args.backend,
+        &cfg,
+        args.base_url.as_deref(),
+        args.model.as_deref(),
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("stratify-judge: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
     if args.dry_run {
         // Counted through the same prepare-and-cache-split path a real run
         // takes, so a committed cache is reflected. A preview that ignores
         // the cache overstates cost in exactly the steady state the README
         // recommends.
-        match Driver::new(None, cache, cfg, Backend::jev()).plan(&report, &ctx) {
+        match Driver::new(None, cache, cfg, backend.clone()).plan(&report, &ctx) {
             Ok((planned, tokens)) => {
-                println!("{planned} request(s) planned, {tokens} tokens estimated, nothing sent.");
+                println!(
+                    "backend {} at {}: {planned} request(s) planned, \
+                     {tokens} tokens estimated, nothing sent.",
+                    backend.name, backend.url
+                );
                 return ExitCode::SUCCESS;
             }
             Err(e) => {
@@ -167,18 +197,16 @@ async fn main() -> ExitCode {
         }
     }
 
-    let client = match &args.base_url {
-        Some(base) => Client::from_env_at(base.clone()),
-        None => Client::from_env(),
-    };
+    let client = client_for(&backend);
     match client {
         None => {
             eprintln!(
-                "stratify-judge: TYPESAFE_API_KEY is not set, passing the report through unchanged"
+                "stratify-judge: {} is not set, passing the report through unchanged",
+                backend.api_key_env
             );
         }
         Some(client) => {
-            let driver = Driver::new(Some(client), cache, cfg, Backend::jev());
+            let driver = Driver::new(Some(client), cache, cfg, backend.clone());
             let stats = match driver.run(&mut report, &ctx).await {
                 Ok(stats) => stats,
                 Err(e) => {
@@ -227,7 +255,8 @@ async fn main() -> ExitCode {
                     if e == "invalid or missing API key" {
                         eprintln!(
                             "stratify-judge: error: {e} (retrying will not help; check \
-                             TYPESAFE_API_KEY)"
+                             {})",
+                            backend.api_key_env
                         );
                     } else {
                         eprintln!("stratify-judge: error: {e}");

@@ -47,6 +47,41 @@ real run uses, so a committed cache shows as zero requests. It always exits
 capture proxy or a local mock, for diagnosing what a live run is actually
 sending and receiving.
 
+## Backends
+
+`--backend <name>` picks which model endpoint to ask. Two presets ship
+built in:
+
+- `jev` (the default): TypeSafe's hosted model at `https://api.typesafe.ai`.
+  Requires `TYPESAFE_API_KEY` and a model id, which defaults to
+  `jev-latest`.
+- `laya`: Convai's Laya, served locally under Apache 2.0 at
+  `http://127.0.0.1:8000`. Needs no key unless `LAYA_API_KEY` is set, in
+  which case it requires one, and it ignores the model id.
+
+`--model <id>` overrides the model sent in the request. `--base-url`
+overrides the endpoint. Both flags overlay whichever backend `--backend`
+resolved: they change where the request goes and what it asks for, not the
+backend's name, auth rules, or token budget. Pointing `--base-url` at a
+different model without also passing `--backend` keeps the original
+backend's rules, which is why `--dry-run` always names the backend it
+resolved before spending anything.
+
+A name that is not a preset needs a `[judge.backends.<name>]` table in
+`stratify.toml` or `stratify-judge.toml`, setting at least `url`.
+
+To run against a local Laya:
+
+```sh
+pip install 'laya[serve]'
+laya-serve --max-len 8192
+stratify check . --format json | stratify-judge --root . --backend laya
+```
+
+`max_len=8192` is required. Laya's default checkpoint is the 512-token
+English one, and 512 tokens of state cannot hold even one `dead_code`
+request; serving it that way trips the context floor on the first finding.
+
 ## Cache
 
 Answers cache under `.stratify/jev-cache/`, keyed on judge version, model,

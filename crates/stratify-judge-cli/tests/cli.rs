@@ -309,3 +309,77 @@ fn an_unknown_schema_version_passes_through_with_a_warning() {
         .success()
         .stderr(predicates::str::contains("schema_version 99"));
 }
+
+/// Review Focus 1: pointing --base-url at another model without
+/// --backend keeps the default backend's rules. That is defensible, but
+/// only if the tool says which backend it resolved.
+#[test]
+fn dry_run_names_the_backend_it_resolved() {
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("TYPESAFE_API_KEY")
+        .args([
+            "--root",
+            fixtures().join("sample-repo").to_str().unwrap(),
+            "--base-url",
+            "http://127.0.0.1:8000",
+            "--dry-run",
+        ])
+        .write_stdin(report_json())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("backend jev"))
+        .stdout(predicates::str::contains("http://127.0.0.1:8000"));
+}
+
+#[test]
+fn the_laya_backend_needs_no_key_to_get_past_the_client_check() {
+    // No LAYA_API_KEY, and laya does not require one, so this must reach
+    // the request stage and fail there rather than passing through as
+    // "no key configured".
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("LAYA_API_KEY")
+        .args([
+            "--root",
+            fixtures().join("sample-repo").to_str().unwrap(),
+            "--backend",
+            "laya",
+            "--base-url",
+            "http://127.0.0.1:1",
+            "--cache-dir",
+            "/tmp/stratify-judge-test-cache",
+        ])
+        .write_stdin(report_json())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("request(s) failed"));
+}
+
+#[test]
+fn an_unknown_backend_fails_with_a_message_naming_both_places() {
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .args([
+            "--root",
+            fixtures().join("sample-repo").to_str().unwrap(),
+            "--backend",
+            "mistral",
+        ])
+        .write_stdin(report_json())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("judge.backends.mistral"));
+}
+
+#[test]
+fn a_missing_key_names_the_backends_own_env_var() {
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("TYPESAFE_API_KEY")
+        .args(["--root", fixtures().join("sample-repo").to_str().unwrap()])
+        .write_stdin(report_json())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("TYPESAFE_API_KEY"));
+}
