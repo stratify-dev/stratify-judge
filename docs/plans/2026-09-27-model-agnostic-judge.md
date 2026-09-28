@@ -1490,6 +1490,18 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/stratify-dev/stratify-j
 
 Then `cargo install --git`, matching the engine README's ordering and wording.
 
+- [ ] **Step 5b: Correct one README claim about --model**
+
+The Backends section says Laya ignores the model id, and separately that
+`--model` overlays whichever backend was resolved. Both are true, but read
+together they suggest `--backend laya --model x` has no effect at all. It does:
+the CLI serializes `"model": "x"` into the request, and whether Laya's server
+then ignores it is a fact about Laya, not about this tool.
+
+Qualify the first claim so the two agree. Say that the `laya` preset sends no
+model unless `--model` or a config table supplies one, rather than that Laya
+ignores the field.
+
 - [ ] **Step 6: Commit**
 
 ```bash
