@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use stratify_judge_core::cache::Cache;
-use stratify_judge_core::config::JevConfig;
+use stratify_judge_core::config::JudgeConfig;
 use stratify_judge_core::context::RepoContext;
 use stratify_judge_core::driver::Driver;
 use stratify_judge_core::model::{Confidence, Report, Severity};
@@ -140,7 +140,7 @@ async fn main() -> ExitCode {
             return exit_code(&args, &report);
         }
     };
-    let cfg = JevConfig::load(&args.root);
+    let cfg = JudgeConfig::load(&args.root);
     // Resolved against the current directory, not --root: the cache is this
     // tool's own bookkeeping, and joining it onto --root would write
     // untracked files into whatever repository is being analysed.

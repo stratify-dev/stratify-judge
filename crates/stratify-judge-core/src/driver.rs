@@ -1,5 +1,5 @@
 use crate::cache::{cache_key, Cache};
-use crate::config::JevConfig;
+use crate::config::JudgeConfig;
 use crate::context::RepoContext;
 use crate::judges::{registry, Judge};
 use crate::model::Report;
@@ -90,7 +90,7 @@ fn slot_prefix(i: usize) -> String {
 pub struct Driver {
     client: Option<Arc<Client>>,
     cache: Cache,
-    cfg: JevConfig,
+    cfg: JudgeConfig,
 }
 
 /// One finding's prepared work: its state, its cache key, and where it
@@ -103,7 +103,7 @@ struct Prepared {
 }
 
 impl Driver {
-    pub fn new(client: Option<Client>, cache: Cache, cfg: JevConfig) -> Driver {
+    pub fn new(client: Option<Client>, cache: Cache, cfg: JudgeConfig) -> Driver {
         Driver {
             client: client.map(Arc::new),
             cache,
@@ -418,7 +418,7 @@ mod tests {
     fn a_zero_batch_size_still_makes_progress() {
         // `.max(1)` is load-bearing: without it `cur.len() >= 0` is true on
         // the first iteration, so an empty batch is pushed and becomes a
-        // request with an empty state and no questions. JevConfig applies no
+        // request with an empty state and no questions. JudgeConfig applies no
         // validation, so batch_findings = 0 in a user's stratify.toml
         // reaches this directly.
         assert_eq!(
@@ -438,9 +438,9 @@ mod tests {
     #[test]
     fn plan_counts_batches_and_discounts_the_cache() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig {
+        let cfg = JudgeConfig {
             batch_findings: 2,
-            ..JevConfig::default()
+            ..JudgeConfig::default()
         };
         let d = Driver::new(None, Cache::new(dir.path().into(), true), cfg);
         // Five dead_code findings at two per batch is three requests, and
@@ -480,7 +480,7 @@ mod tests {
         // Before anything is cached the plan is one request, at a nonzero
         // token cost.
         let (requests, tokens) =
-            Driver::new(None, cache(), JevConfig::default()).plan(&report(1), &ctx());
+            Driver::new(None, cache(), JudgeConfig::default()).plan(&report(1), &ctx());
         assert_eq!(requests, 1);
         assert!(tokens > 0);
 
@@ -490,12 +490,12 @@ mod tests {
         let d = Driver::new(
             Some(Client::new(server.uri(), "k".into())),
             cache(),
-            JevConfig::default(),
+            JudgeConfig::default(),
         );
         d.run(&mut report(1), &ctx()).await;
 
         assert_eq!(
-            Driver::new(None, cache(), JevConfig::default()).plan(&report(1), &ctx()),
+            Driver::new(None, cache(), JudgeConfig::default()).plan(&report(1), &ctx()),
             (0, 0)
         );
     }
@@ -506,7 +506,7 @@ mod tests {
         let d = Driver::new(
             None,
             Cache::new(dir.path().into(), true),
-            JevConfig::default(),
+            JudgeConfig::default(),
         );
         let mut r = report(3);
         let before = r.clone();
@@ -542,7 +542,7 @@ mod tests {
         let d = Driver::new(
             Some(client),
             Cache::new(dir.path().into(), true),
-            JevConfig::default(),
+            JudgeConfig::default(),
         );
 
         let mut r = report(1);
@@ -575,7 +575,7 @@ mod tests {
         let d = Driver::new(
             Some(Client::new(server.uri(), "k".into())),
             Cache::new(dir.path().into(), false),
-            JevConfig::default(),
+            JudgeConfig::default(),
         );
         let mut r = report(2);
         d.run(&mut r, &ctx()).await;
@@ -637,7 +637,7 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig::default();
+        let cfg = JudgeConfig::default();
         let make = || {
             Driver::new(
                 Some(Client::new(server.uri(), "k".into())),
@@ -696,7 +696,7 @@ mod tests {
             Driver::new(
                 Some(Client::new(server.uri(), "k".into())),
                 Cache::new(dir.path().into(), true),
-                JevConfig::default(),
+                JudgeConfig::default(),
             )
         };
 
@@ -749,9 +749,9 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig {
+        let cfg = JudgeConfig {
             batch_findings: 1,
-            ..JevConfig::default()
+            ..JudgeConfig::default()
         };
         let d = Driver::new(
             Some(
@@ -801,9 +801,9 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig {
+        let cfg = JudgeConfig {
             batch_findings: 10,
-            ..JevConfig::default()
+            ..JudgeConfig::default()
         };
         let d = Driver::new(
             Some(
@@ -838,9 +838,9 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig {
+        let cfg = JudgeConfig {
             batch_findings: 1,
-            ..JevConfig::default()
+            ..JudgeConfig::default()
         };
         let d = Driver::new(
             Some(
@@ -890,7 +890,7 @@ mod tests {
         let d = Driver::new(
             Some(Client::new(server.uri(), "k".into())),
             Cache::new(dir.path().into(), false),
-            JevConfig::default(),
+            JudgeConfig::default(),
         );
         let stats = d.run(&mut r, &ctx()).await;
         assert_eq!(stats.missing_sources, 1);
@@ -906,9 +906,9 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig {
+        let cfg = JudgeConfig {
             concurrency: 2,
-            ..JevConfig::default()
+            ..JudgeConfig::default()
         };
         let d = Driver::new(
             Some(
