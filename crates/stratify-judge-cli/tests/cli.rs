@@ -337,6 +337,13 @@ fn the_laya_backend_needs_no_key_to_get_past_the_client_check() {
     // No LAYA_API_KEY, and laya does not require one, so this must reach
     // the request stage and fail there rather than passing through as
     // "no key configured".
+    //
+    // Deferred-minor 4: a tempdir, not a shared /tmp path other test runs
+    // could race on. The default RetryPolicy against an unreachable
+    // 127.0.0.1:1 still sleeps through its 500+1000+2000ms backoff here,
+    // most of this file's runtime; JudgeConfig exposes no retry or backoff
+    // knob to shorten it from a test config, so that timing is left alone.
+    let cache_dir = tempfile::tempdir().unwrap();
     Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("LAYA_API_KEY")
@@ -348,7 +355,7 @@ fn the_laya_backend_needs_no_key_to_get_past_the_client_check() {
             "--base-url",
             "http://127.0.0.1:1",
             "--cache-dir",
-            "/tmp/stratify-judge-test-cache",
+            cache_dir.path().to_str().unwrap(),
         ])
         .write_stdin(report_json())
         .assert()
