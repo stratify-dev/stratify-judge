@@ -1,4 +1,4 @@
-use stratify_jev_judge::model::{Confidence, Finding, Report, Severity};
+use stratify_judge_core::model::{Confidence, Finding, Report, Severity};
 
 /// A finding is shown when its confidence reaches the threshold, or when
 /// the caller asked to see everything.
@@ -61,7 +61,7 @@ pub fn render(report: &Report, min: Confidence, show_dismissed: bool) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stratify_jev_judge::model::{Confidence, Finding, Report, Severity, Span};
+    use stratify_judge_core::model::{Confidence, Finding, Report, Severity, Span};
 
     fn finding(conf: Confidence, judged: bool) -> Finding {
         let mut extra = serde_json::Map::new();

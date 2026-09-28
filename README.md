@@ -1,4 +1,4 @@
-# stratify-jev
+# stratify-judge
 
 Judgment layer for [Stratify](https://github.com/stratify-dev/stratify). Reads a
 Stratify JSON report, asks [Jev](https://docs.typesafe.ai) what static analysis
@@ -7,7 +7,7 @@ already uses.
 
 ```sh
 export TYPESAFE_API_KEY=...
-stratify check . --format json | stratify-jev --root .
+stratify check . --format json | stratify-judge --root .
 ```
 
 ```
@@ -24,7 +24,7 @@ uncertain, it reports `possibly unused` rather than a false `unused`. The
 residue is noise a reviewer dismisses in one second: framework hooks, test
 helpers, and symbols reached only through reflection.
 
-`stratify-jev` asks Jev about that residue. A finding is never deleted. A
+`stratify-judge` asks Jev about that residue. A finding is never deleted. A
 dismissed finding drops below the display threshold and keeps its full
 judgment, every raw probability included, in the JSON output.
 
@@ -36,7 +36,7 @@ a dependency of the scan.
 
 ## Options
 
-Run `stratify-jev --help`.
+Run `stratify-judge --help`.
 
 `--dry-run` reports how many requests a real run would send, its total
 token estimate, and sends nothing. It counts through the same cache check a

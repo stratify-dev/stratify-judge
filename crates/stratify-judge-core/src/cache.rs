@@ -1,9 +1,9 @@
-use jev_client::{Answer, Question, Usage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
+use systemone_client::{Answer, Question, Usage};
 
 /// One cached finding's answers. Raw answers only, never verdicts, so a
 /// threshold change re-scores from disk with no network call.
@@ -109,8 +109,8 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jev_client::{Answer, Question, Usage};
     use serde_json::json;
+    use systemone_client::{Answer, Question, Usage};
 
     fn questions() -> BTreeMap<String, Question> {
         [("framework_invoked".to_string(), Question::noul("q", None))]

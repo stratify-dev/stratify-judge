@@ -1,4 +1,4 @@
-use stratify_jev_judge::model::Report;
+use stratify_judge_core::model::Report;
 
 /// Keeps the engine's findings shape so existing consumers still parse,
 /// and never drops a finding: a dismissed one is present with its
@@ -8,7 +8,7 @@ pub fn render(report: &Report, tool_version: &str) -> String {
     if let Some(obj) = v.as_object_mut() {
         obj.insert(
             "judged_by".to_string(),
-            serde_json::Value::String(format!("stratify-jev/{tool_version}")),
+            serde_json::Value::String(format!("stratify-judge/{tool_version}")),
         );
     }
     let mut body = serde_json::to_string_pretty(&v).unwrap_or_default();
@@ -19,7 +19,7 @@ pub fn render(report: &Report, tool_version: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stratify_jev_judge::model::{Confidence, Finding, Report, Severity, Span};
+    use stratify_judge_core::model::{Confidence, Finding, Report, Severity, Span};
 
     /// M4: the last byte must be a newline, or `diff`, line-oriented
     /// tooling, and shell `$(...)` round-trips all break on the output.
@@ -58,7 +58,7 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::from_str(&render(&r, "0.1.0")).unwrap();
         assert_eq!(v["schema_version"], 1);
-        assert_eq!(v["judged_by"], "stratify-jev/0.1.0");
+        assert_eq!(v["judged_by"], "stratify-judge/0.1.0");
         assert_eq!(v["findings"][0]["rule"], "dead_code");
         assert_eq!(v["findings"][0]["confidence"], "unknown");
     }

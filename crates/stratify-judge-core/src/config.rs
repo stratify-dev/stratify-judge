@@ -100,10 +100,10 @@ struct Wrapper {
 
 impl JevConfig {
     /// `[jev]` from `stratify.toml`, overridden wholesale by
-    /// `stratify-jev.toml` when that file exists. Unparseable or absent
+    /// `stratify-judge.toml` when that file exists. Unparseable or absent
     /// falls back to defaults, matching how the engine reads its own tables.
     pub fn load(root: &Path) -> JevConfig {
-        for name in ["stratify-jev.toml", "stratify.toml"] {
+        for name in ["stratify-judge.toml", "stratify.toml"] {
             let Ok(text) = std::fs::read_to_string(root.join(name)) else {
                 continue;
             };
@@ -167,7 +167,7 @@ dismiss_at = 0.9
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("stratify.toml"), "[jev]\nconcurrency = 3\n").unwrap();
         std::fs::write(
-            dir.path().join("stratify-jev.toml"),
+            dir.path().join("stratify-judge.toml"),
             "[jev]\nconcurrency = 16\n",
         )
         .unwrap();

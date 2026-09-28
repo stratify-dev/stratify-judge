@@ -8,9 +8,9 @@ use crate::model::Report;
 #[cfg(test)]
 use crate::model::Finding;
 use crate::verdict::{apply, Judgment, Verdict};
-use jev_client::{Answer, Client, Question, SystemOneRequest};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use systemone_client::{Answer, Client, Question, SystemOneRequest};
 
 pub const TOKEN_CEILING: usize = 24_000;
 
@@ -363,9 +363,9 @@ impl Driver {
 mod tests {
     use super::*;
     use crate::model::{Confidence, Severity, Span};
-    use jev_client::RetryPolicy;
     use serde_json::json;
     use std::path::PathBuf;
+    use systemone_client::RetryPolicy;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

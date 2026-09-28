@@ -34,7 +34,7 @@ fn ok_answer_body() -> serde_json::Value {
 
 #[test]
 fn without_an_api_key_the_report_passes_through_and_exits_zero() {
-    let out = Command::cargo_bin("stratify-jev")
+    let out = Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args([
@@ -62,7 +62,7 @@ fn without_an_api_key_the_report_passes_through_and_exits_zero() {
 /// notice stdout is empty and --fail-on never still failed.
 #[test]
 fn an_unreadable_root_still_passes_the_report_through() {
-    let out = Command::cargo_bin("stratify-jev")
+    let out = Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args(["--root", "/no/such/directory/anywhere", "--format", "json"])
@@ -81,7 +81,7 @@ fn an_unreadable_root_still_passes_the_report_through() {
 
 #[test]
 fn an_unreadable_root_respects_fail_on_never() {
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args([
@@ -98,7 +98,7 @@ fn an_unreadable_root_respects_fail_on_never() {
 
 #[test]
 fn a_missing_key_warns_on_stderr_without_failing() {
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args(["--root", fixtures().join("sample-repo").to_str().unwrap()])
@@ -110,7 +110,7 @@ fn a_missing_key_warns_on_stderr_without_failing() {
 
 #[test]
 fn dry_run_reports_planned_requests_and_sends_nothing() {
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env("TYPESAFE_API_KEY", "not-a-real-key")
         .args([
@@ -126,7 +126,7 @@ fn dry_run_reports_planned_requests_and_sends_nothing() {
 
 #[test]
 fn fail_on_warning_exits_nonzero_when_a_warning_survives() {
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args([
@@ -150,7 +150,7 @@ async fn an_auth_failure_names_authentication_not_just_a_count() {
         .mount(&server)
         .await;
 
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env("TYPESAFE_API_KEY", "obviously-not-a-real-key")
         .args([
@@ -183,7 +183,7 @@ async fn a_root_mismatched_with_the_report_warns_about_it() {
     // test does not leave a stray .stratify/ next to the crate's sources.
     let cache_dir = tempfile::tempdir().unwrap();
 
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env("TYPESAFE_API_KEY", "test-key")
         .args([
@@ -211,7 +211,7 @@ fn show_dismissed_does_not_change_the_exit_code() {
         "confidence":"unknown"
     }]}"#;
 
-    let without = Command::cargo_bin("stratify-jev")
+    let without = Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args([
@@ -222,7 +222,7 @@ fn show_dismissed_does_not_change_the_exit_code() {
         ])
         .write_stdin(body)
         .assert();
-    let with_show = Command::cargo_bin("stratify-jev")
+    let with_show = Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args([
@@ -246,7 +246,7 @@ fn show_dismissed_does_not_change_the_exit_code() {
 /// request count.
 #[test]
 fn dry_run_reports_a_token_estimate_too() {
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env("TYPESAFE_API_KEY", "not-a-real-key")
         .args([
@@ -273,7 +273,7 @@ async fn the_cache_lands_under_the_current_directory_not_root() {
         .await;
 
     let cwd = tempfile::tempdir().unwrap();
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .current_dir(cwd.path())
         .env("TYPESAFE_API_KEY", "test-key")
@@ -300,7 +300,7 @@ async fn the_cache_lands_under_the_current_directory_not_root() {
 #[test]
 fn an_unknown_schema_version_passes_through_with_a_warning() {
     let body = r#"{"schema_version":99,"findings":[]}"#;
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args(["--root", fixtures().join("sample-repo").to_str().unwrap()])

@@ -1,15 +1,15 @@
 mod output;
 
 use clap::{Parser, ValueEnum};
-use jev_client::Client;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use stratify_jev_judge::cache::Cache;
-use stratify_jev_judge::config::JevConfig;
-use stratify_jev_judge::context::RepoContext;
-use stratify_jev_judge::driver::Driver;
-use stratify_jev_judge::model::{Confidence, Report, Severity};
+use stratify_judge_core::cache::Cache;
+use stratify_judge_core::config::JevConfig;
+use stratify_judge_core::context::RepoContext;
+use stratify_judge_core::driver::Driver;
+use stratify_judge_core::model::{Confidence, Report, Severity};
+use systemone_client::Client;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -46,7 +46,7 @@ enum FailOn {
 
 /// Judge a Stratify report with Jev. Reads the report on stdin.
 #[derive(Parser)]
-#[command(name = "stratify-jev", version)]
+#[command(name = "stratify-judge", version)]
 struct Args {
     /// Repository root, used for source reads and the file walk.
     #[arg(long, default_value = ".")]
@@ -100,21 +100,21 @@ async fn main() -> ExitCode {
         None => std::io::stdin().read_to_string(&mut raw).map(|_| ()),
     };
     if let Err(e) = read {
-        eprintln!("stratify-jev: cannot read the report: {e}");
+        eprintln!("stratify-judge: cannot read the report: {e}");
         return ExitCode::from(2);
     }
 
     let mut report: Report = match serde_json::from_str(&raw) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("stratify-jev: the input is not a Stratify JSON report: {e}");
+            eprintln!("stratify-judge: the input is not a Stratify JSON report: {e}");
             return ExitCode::from(2);
         }
     };
 
     if report.schema_version > Report::KNOWN_SCHEMA_VERSION {
         eprintln!(
-            "stratify-jev: schema_version {} is newer than this build understands, \
+            "stratify-judge: schema_version {} is newer than this build understands, \
              passing the report through unchanged",
             report.schema_version
         );
@@ -132,7 +132,7 @@ async fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "stratify-jev: cannot read {}: {e}. Passing the report through \
+                "stratify-judge: cannot read {}: {e}. Passing the report through \
                  unchanged, nothing was judged",
                 args.root.display()
             );
@@ -163,7 +163,7 @@ async fn main() -> ExitCode {
     match client {
         None => {
             eprintln!(
-                "stratify-jev: TYPESAFE_API_KEY is not set, passing the report through unchanged"
+                "stratify-judge: TYPESAFE_API_KEY is not set, passing the report through unchanged"
             );
         }
         Some(client) => {
@@ -171,7 +171,7 @@ async fn main() -> ExitCode {
             let stats = driver.run(&mut report, &ctx).await;
             if args.verbose {
                 eprintln!(
-                    "stratify-jev: {} judged, {} from cache, {} request(s), {} failed, {} input tokens",
+                    "stratify-judge: {} judged, {} from cache, {} request(s), {} failed, {} input tokens",
                     stats.judged,
                     stats.from_cache,
                     stats.requested,
@@ -186,7 +186,7 @@ async fn main() -> ExitCode {
             // with genuinely generated or moved files should still work.
             if stats.prepared > 0 && stats.missing_sources * 2 > stats.prepared {
                 eprintln!(
-                    "stratify-jev: {} of {} findings name files that do not exist under {}; \
+                    "stratify-judge: {} of {} findings name files that do not exist under {}; \
                      is --root correct?",
                     stats.missing_sources,
                     stats.prepared,
@@ -198,18 +198,18 @@ async fn main() -> ExitCode {
             // that makes a bad key indistinguishable from a timeout.
             if stats.failed > 0 {
                 eprintln!(
-                    "stratify-jev: {} request(s) failed, {} finding(s) unjudged and left \
+                    "stratify-judge: {} request(s) failed, {} finding(s) unjudged and left \
                      unchanged",
                     stats.failed, stats.unjudged
                 );
                 for e in &stats.errors {
                     if e == "invalid or missing API key" {
                         eprintln!(
-                            "stratify-jev: error: {e} (retrying will not help; check \
+                            "stratify-judge: error: {e} (retrying will not help; check \
                              TYPESAFE_API_KEY)"
                         );
                     } else {
-                        eprintln!("stratify-jev: error: {e}");
+                        eprintln!("stratify-judge: error: {e}");
                     }
                 }
             }

@@ -4,8 +4,8 @@ use crate::config::Thresholds;
 use crate::context::RepoContext;
 use crate::model::{Finding, Severity};
 use crate::verdict::Judgment;
-use jev_client::{Answer, Question};
 use std::collections::BTreeMap;
+use systemone_client::{Answer, Question};
 
 /// Adjusts findings the engine already produced.
 pub trait Judge: Send + Sync {

@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/jev-client", "crates/stratify-jev-judge", "crates/stratify-jev-cli"]
+members = ["crates/systemone-client", "crates/stratify-judge-core", "crates/stratify-judge-cli"]
 
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/stratify-dev/stratify-jev"
+repository = "https://github.com/stratify-dev/stratify-judge"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
