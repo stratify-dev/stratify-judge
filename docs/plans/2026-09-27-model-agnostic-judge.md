@@ -1329,6 +1329,44 @@ Handle `RunError` from `driver.run` the same way: print it, print the report, re
 Run: `cargo test && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 Expected: PASS.
 
+- [ ] **Step 4b: Remove the vendor facts the client crate no longer owns**
+
+Replacing the CLI's `Client::from_env_at` / `from_env` with `client_for` orphans
+more than those two methods. In `crates/systemone-client/src/client.rs`:
+
+```rust
+pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
+pub const ENV_API_KEY: &str = "TYPESAFE_API_KEY";
+```
+
+Both are now duplicated by `Backend::jev()`, which carries the same url and the
+same env var name. Two sources for one fact, and the pattern a previous review
+already caught elsewhere in this codebase.
+
+They are also the last vendor-specific things in a crate this project renamed
+specifically to be protocol-named rather than vendor-named. A crate called
+`systemone-client` should not hardcode one vendor's endpoint as its default or
+one vendor's environment variable as *the* API key.
+
+So delete, in this order:
+
+1. `Client::from_env`, `Client::from_env_at`, and the private `from_key`, along
+   with their tests. `usable_key` stays: `client_for` calls it, and its tests
+   are what cover the empty-key rule.
+2. `DEFAULT_BASE_URL` and `ENV_API_KEY`.
+
+`Backend::jev()` keeps the literals, which is now their only home.
+
+Note that `pub const` items produce no unused warning, so clippy will not tell
+you these are dead. Confirm by grep that nothing references them:
+
+```bash
+grep -rn 'DEFAULT_BASE_URL\|ENV_API_KEY\|from_env\|from_key' crates/ || echo "clean"
+```
+
+The CLI's integration tests legitimately still name `TYPESAFE_API_KEY` as a
+string, since that is the env var `Backend::jev()` reads. Those stay.
+
 - [ ] **Step 5: Update the README**
 
 Add a Backends section documenting both presets, the three flags, and the local Laya recipe:
