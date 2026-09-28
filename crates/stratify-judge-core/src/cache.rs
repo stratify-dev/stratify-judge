@@ -30,9 +30,13 @@ pub fn cache_key(
     let mut h = Sha256::new();
     feed(&mut h, judge.as_bytes());
     h.update(version.to_le_bytes()); // fixed width, needs no framing
-                                     // The backend identifies the model that answered. Without it a
-                                     // committed cache would serve one model's verdicts to another's run.
+
+    // The backend identifies the model that answered, and the endpoint it
+    // answered from. Without both, a committed cache would serve one
+    // model's verdicts to another's run, or one endpoint's answers under
+    // a name that no longer names where they came from.
     feed(&mut h, backend.name.as_bytes());
+    feed(&mut h, backend.url.as_bytes());
     // Tagged, so an absent model and an empty one are different inputs.
     match &backend.model {
         Some(m) => {
@@ -271,5 +275,26 @@ mod tests {
             ..Backend::laya()
         };
         assert_ne!(laya, cache_key("dead_code", 1, &empty, &s, &q));
+    }
+
+    /// I2: `--base-url` changes which model answers without changing the
+    /// backend's name, so the url has to be part of the key too, or a
+    /// committed cache would serve one endpoint's answers to another's run.
+    #[test]
+    fn two_backends_identical_except_for_url_produce_different_keys() {
+        let s = json!({ "name": "helper" });
+        let q = questions();
+        let a = cache_key("dead_code", 1, &Backend::jev(), &s, &q);
+        let b = cache_key(
+            "dead_code",
+            1,
+            &Backend {
+                url: "http://127.0.0.1:9999".into(),
+                ..Backend::jev()
+            },
+            &s,
+            &q,
+        );
+        assert_ne!(a, b, "same name and model, different url, must differ");
     }
 }

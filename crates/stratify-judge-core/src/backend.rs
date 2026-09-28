@@ -275,7 +275,8 @@ state_tokens = 1024
         assert_eq!(b.url, "http://127.0.0.1:8000");
         assert_eq!(
             b.name, "jev",
-            "still jev, so the cache key does not collide"
+            "the name stays jev; the cache key tells the two backends apart \
+             through the url instead"
         );
         assert!(b.api_key_required, "still demands TYPESAFE_API_KEY");
         assert_eq!(
