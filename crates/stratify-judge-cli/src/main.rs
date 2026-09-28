@@ -77,7 +77,7 @@ struct Args {
     #[arg(long)]
     no_cache: bool,
 
-    #[arg(long, default_value = ".stratify/jev-cache")]
+    #[arg(long, default_value = ".stratify/judge-cache")]
     cache_dir: PathBuf,
 
     /// Which model endpoint to ask: a built-in preset (jev, laya) or a

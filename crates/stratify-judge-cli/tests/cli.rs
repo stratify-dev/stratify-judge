@@ -288,7 +288,7 @@ async fn the_cache_lands_under_the_current_directory_not_root() {
         .success();
 
     assert!(
-        cwd.path().join(".stratify/jev-cache").exists(),
+        cwd.path().join(".stratify/judge-cache").exists(),
         "cache must land under the current directory"
     );
     assert!(

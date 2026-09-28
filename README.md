@@ -119,7 +119,7 @@ request; serving it that way trips the context floor on the first finding.
 
 ## Cache
 
-Answers cache under `.stratify/jev-cache/`, keyed on judge version, model,
+Answers cache under `.stratify/judge-cache/`, keyed on judge version, model,
 state, and question set. Commit the directory: CI then runs without calling the
 API, results stay deterministic, and a change to question wording shows up as a
 reviewable diff of verdicts.
