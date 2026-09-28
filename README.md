@@ -131,10 +131,13 @@ reviewable diff of verdicts.
 The cache directory is resolved against the current directory, not `--root`,
 so it never lands as untracked files inside the repository being analysed.
 
-The cache key hashes the backend name and the backend's model. An answer from
+The cache key hashes the backend name, its url, and its model. An answer from
 Jev and an answer from Laya never share a key, so switching `--backend` does
-not cause a stale cache hit. The entry records the concrete model that actually
-answered separately, in case that differs from the request.
+not cause a stale cache hit, and pointing `--base-url` at a different endpoint
+without also changing `--backend` cannot silently serve that endpoint's
+answers under the original backend's name either. The entry records the
+concrete model that actually answered separately, in case that differs from
+the request.
 
 The model is tagged in the hash so an absent model (Laya) and an empty string
 are different inputs. This is deliberate for CI: a cached answer stays a hit
