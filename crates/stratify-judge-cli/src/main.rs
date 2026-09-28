@@ -220,13 +220,17 @@ async fn main() -> ExitCode {
             let driver = Driver::new(Some(client), cache, cfg, backend.clone());
             let stats = match driver.run(&mut report, &ctx).await {
                 Ok(stats) => stats,
-                Err(e) => {
+                Err(failure) => {
                     // Same pass-through rule as every other failure here: a
                     // context floor stops judging, not the report from
                     // reaching the caller or --fail-on from gating on it.
-                    eprintln!("stratify-judge: {e}");
-                    print!("{}", render(&args, &report));
-                    return exit_code(&args, &report);
+                    // Falling through instead of returning here, with the
+                    // stats the floor had already earned, is what keeps
+                    // --verbose, the --root mismatch warning and the
+                    // per-error detail block below running exactly as they
+                    // do on any other failure path.
+                    eprintln!("stratify-judge: {failure}");
+                    failure.stats
                 }
             };
             if args.verbose {

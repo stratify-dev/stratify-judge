@@ -432,3 +432,86 @@ fn the_backend_flag_beats_a_config_key_naming_a_different_backend() {
         .success()
         .stdout(predicates::str::contains("backend jev"));
 }
+
+/// I4: a context-floor error must not swallow the --verbose summary or the
+/// accounting for work already applied. One finding is warmed into the
+/// cache first; the second run adds an uncached finding under a budget too
+/// small to hold it, and the warm entry's stats must still reach stderr
+/// alongside the floor error.
+#[tokio::test]
+async fn a_floor_error_still_prints_the_verbose_summary_for_what_already_applied() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_answer_body()))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+
+    let warm_body = r#"{"schema_version":1,"findings":[{
+        "rule":"dead_code","severity":"info",
+        "message":"possibly unused function `warm`",
+        "span":{"file":"src/lib.rs","start_byte":0,"end_byte":10,"start_line":1},
+        "confidence":"likely"
+    }]}"#;
+    let both_body = r#"{"schema_version":1,"findings":[{
+        "rule":"dead_code","severity":"info",
+        "message":"possibly unused function `warm`",
+        "span":{"file":"src/lib.rs","start_byte":0,"end_byte":10,"start_line":1},
+        "confidence":"likely"
+    },{
+        "rule":"dead_code","severity":"info",
+        "message":"possibly unused function `cold`",
+        "span":{"file":"src/lib.rs","start_byte":20,"end_byte":30,"start_line":5},
+        "confidence":"likely"
+    }]}"#;
+
+    // Warm the cache for one finding at Laya's full 8,192-token budget, so
+    // the request actually succeeds and the answer lands on disk.
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("LAYA_API_KEY")
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "--backend",
+            "laya",
+            "--base-url",
+            &server.uri(),
+            "--cache-dir",
+            cache_dir.path().to_str().unwrap(),
+        ])
+        .write_stdin(warm_body)
+        .assert()
+        .success();
+
+    // Now shrink Laya's budget below what the second, uncached finding
+    // needs. The cache key does not include state_tokens, so the warm
+    // entry still hits; only the new finding trips the floor.
+    std::fs::write(
+        root.path().join("stratify-judge.toml"),
+        "[judge.backends.laya]\nstate_tokens = 512\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("LAYA_API_KEY")
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "--backend",
+            "laya",
+            "--base-url",
+            &server.uri(),
+            "--cache-dir",
+            cache_dir.path().to_str().unwrap(),
+            "--verbose",
+        ])
+        .write_stdin(both_body)
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("512"))
+        .stderr(predicates::str::contains("1 from cache"));
+}

@@ -50,6 +50,24 @@ impl std::fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
+/// A `RunError` plus whatever `run` had already accounted for when it
+/// tripped. The context floor is checked per judge, after that judge's
+/// cache hits are already applied to the report, so a bare `RunError`
+/// would discard the accounting for work that genuinely happened.
+#[derive(Debug)]
+pub struct RunFailure {
+    pub stats: RunStats,
+    pub error: RunError,
+}
+
+impl std::fmt::Display for RunFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for RunFailure {}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunStats {
     pub judged: usize,
@@ -61,10 +79,10 @@ pub struct RunStats {
     /// Distinct error messages, first occurrence of each kept. A hundred
     /// identical 401s must print once, not a hundred times.
     pub errors: Vec<String>,
-    /// Findings lost to a failed request. `failed` counts batches; with
-    /// `batch_findings` above one, a single failed batch loses several
-    /// findings, and a message that only names `failed` reads as if it
-    /// means one finding per failure.
+    /// Findings lost to a failed request or to the context floor. `failed`
+    /// counts batches; with `batch_findings` above one, a single failed
+    /// batch loses several findings, and a message that only names
+    /// `failed` reads as if it means one finding per failure.
     pub unjudged: usize,
     /// Findings prepared for judging whose span names a file this run could
     /// not read. A high count against `prepared` is the signature of a
@@ -216,7 +234,15 @@ impl Driver {
     /// Judge every finding a registered judge claims. Findings the model
     /// never reaches, for any reason, are left exactly as the engine
     /// reported them.
-    pub async fn run(&self, report: &mut Report, ctx: &RepoContext) -> Result<RunStats, RunError> {
+    ///
+    /// The error is boxed: `RunFailure` carries a whole `RunStats`, which
+    /// clippy's `result_large_err` correctly flags next to a `RunStats`-only
+    /// success path.
+    pub async fn run(
+        &self,
+        report: &mut Report,
+        ctx: &RepoContext,
+    ) -> Result<RunStats, Box<RunFailure>> {
         let mut stats = RunStats::default();
         let Some(client) = self.client.clone() else {
             return Ok(stats);
@@ -288,7 +314,15 @@ impl Driver {
                     (name, p.tokens)
                 })
                 .collect();
-            self.check_fits(&items)?;
+            if let Err(error) = self.check_fits(&items) {
+                // The stats accumulated so far already reflect real work:
+                // this judge's cache hits were applied above, before the
+                // misses were ever built. Losing them here would make
+                // --verbose, under a warm cache plus a too-small backend,
+                // report nothing at all.
+                stats.unjudged += misses.len();
+                return Err(Box::new(RunFailure { stats, error }));
+            }
 
             // Batch the misses and fire them concurrently.
             let est: Vec<usize> = misses.iter().map(|p| p.tokens).collect();
@@ -1103,6 +1137,78 @@ mod tests {
         let sent = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
         assert!(body.get("model").is_none(), "no model key at all: {body}");
+    }
+
+    /// I4: the context floor is checked only against the misses, after this
+    /// judge's cache hits are already applied to the report. A `RunFailure`
+    /// must still carry that accounting rather than discard it, or
+    /// `--verbose` under a warm cache plus a too-small backend reports
+    /// nothing at all.
+    #[tokio::test]
+    async fn a_floor_error_after_a_cache_hit_still_carries_its_stats() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "jev-1.13.0",
+                "answers": {
+                    "s0__framework_invoked": { "noul": 0.95 },
+                    "s0__test_only": { "noul": 0.01 },
+                    "s0__external_api": { "noul": 0.02 },
+                    "s0__resolver_missed_a_call": { "noul": 0.03 },
+                    "s0__explanation": {
+                        "choice": "framework_invoked",
+                        "probabilities": {},
+                        "confidence": 0.9
+                    }
+                },
+                "usage": { "input_tokens": 300, "output_tokens": 0 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Backend {
+            url: server.uri(),
+            ..Backend::jev()
+        };
+
+        // Warm the cache for one finding at the full-size budget, so the
+        // request actually succeeds and the answer lands on disk.
+        let warm = Driver::new(
+            Some(Client::new(server.uri(), Some("k".into()))),
+            Cache::new(dir.path().into(), true),
+            JudgeConfig::default(),
+            backend.clone(),
+        );
+        warm.run(&mut report(1), &ctx()).await.unwrap();
+
+        // Same name, url and model, so the cache key matches and the warm
+        // entry still hits; only state_tokens shrinks, which is not part
+        // of the key. The second finding is new, so it is a miss the tiny
+        // ceiling cannot hold.
+        let tiny = Backend {
+            state_tokens: 1,
+            ..backend
+        };
+        let cold = Driver::new(
+            Some(Client::new(server.uri(), Some("k".into()))),
+            Cache::new(dir.path().into(), true),
+            JudgeConfig::default(),
+            tiny,
+        );
+        let mut r = report(2);
+        let failure = cold.run(&mut r, &ctx()).await.unwrap_err();
+        assert!(
+            failure.stats.from_cache >= 1,
+            "the cache hit must survive the failure: {:?}",
+            failure.stats
+        );
+        assert!(
+            failure.stats.unjudged > 0,
+            "the floor-dropped finding must be counted: {:?}",
+            failure.stats
+        );
     }
 
     /// Review Focus 3: a budget too small for one finding must say so by
