@@ -12,7 +12,7 @@ stratify check . --format json | stratify-judge --root .
 
 ```
 info  src/lib.rs:6  possibly unused function `helper`
-      jev: reached by a framework (0.91)
+      jev-latest: reached by a framework (0.91)
 
 73 findings, 9 shown, 64 hidden. Re-run with --show-dismissed to see them.
 ```
