@@ -265,6 +265,38 @@ state_tokens = 1024
     }
 
     #[test]
+    fn a_config_only_backend_with_no_url_anywhere_is_an_error() {
+        let cfg: JudgeConfig = toml::from_str(
+            r#"
+[backends.mine]
+state_tokens = 4096
+"#,
+        )
+        .unwrap();
+        let err = resolve_backend("mine", &cfg, None, None).unwrap_err();
+        assert!(err.contains("no url"), "got {err}");
+        assert!(err.contains("--base-url"), "says how to supply one: {err}");
+    }
+
+    #[test]
+    fn a_url_flag_can_supply_the_url_a_config_table_omits() {
+        // A table that sets only a budget is a reasonable thing to write:
+        // the endpoint's capacity is stable while its address moves between
+        // environments. The url check therefore runs after the flags.
+        let cfg: JudgeConfig = toml::from_str(
+            r#"
+[backends.mine]
+state_tokens = 4096
+"#,
+        )
+        .unwrap();
+        let b = resolve_backend("mine", &cfg, Some("http://10.0.0.9:8000"), None).unwrap();
+        assert_eq!(b.url, "http://10.0.0.9:8000");
+        assert_eq!(b.state_tokens, 4096, "the table's budget survives");
+        assert_eq!(b.name, "mine");
+    }
+
+    #[test]
     fn a_config_only_backend_needs_no_preset() {
         let cfg: JudgeConfig = toml::from_str(
             r#"
@@ -433,14 +465,7 @@ pub fn resolve_backend(
                 api_key_required: false,
                 state_tokens: 0,
             };
-            let built = over.apply(neutral);
-            if built.url.is_empty() {
-                return Err(format!(
-                    "backend `{name}` has no url: set `url` under \
-                     [judge.backends.{name}]"
-                ));
-            }
-            built
+            over.apply(neutral)
         }
         (None, None) => {
             return Err(format!(
@@ -457,6 +482,16 @@ pub fn resolve_backend(
     }
     if let Some(m) = model_flag {
         out.model = Some(m.to_string());
+    }
+    // Checked after the flags, so `--base-url` can supply the url for a
+    // config table that sets only a budget. A url is the one field with no
+    // sensible default: a preset carries one, and a config-only backend has
+    // to get it from somewhere.
+    if out.url.is_empty() {
+        return Err(format!(
+            "backend `{name}` has no url: set `url` under \
+             [judge.backends.{name}], or pass --base-url"
+        ));
     }
     Ok(out)
 }
