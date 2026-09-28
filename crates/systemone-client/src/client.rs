@@ -66,18 +66,20 @@ fn usable_key(raw: Option<String>) -> Option<String> {
 /// mutating process-global state.
 fn from_key(base: impl Into<String>, raw_key: Option<String>) -> Option<Client> {
     let key = usable_key(raw_key)?;
-    Some(Client::new(base.into(), key))
+    Some(Client::new(base.into(), Some(key)))
 }
 
 pub struct Client {
     http: reqwest::Client,
     base: String,
-    key: String,
+    /// None for an endpoint that needs no auth, such as a local
+    /// laya-serve without LAYA_API_KEY set.
+    key: Option<String>,
     retry: RetryPolicy,
 }
 
 impl Client {
-    pub fn new(base: String, key: String) -> Client {
+    pub fn new(base: String, key: Option<String>) -> Client {
         Client {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
@@ -113,13 +115,11 @@ impl Client {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let sent = self
-                .http
-                .post(&url)
-                .bearer_auth(&self.key)
-                .json(req)
-                .send()
-                .await;
+            let mut request = self.http.post(&url).json(req);
+            if let Some(k) = &self.key {
+                request = request.bearer_auth(k);
+            }
+            let sent = request.send().await;
 
             let resp = match sent {
                 Ok(r) => r,
@@ -176,7 +176,7 @@ mod tests {
     fn req() -> SystemOneRequest {
         SystemOneRequest {
             state: json!({ "finding_0": { "name": "helper" } }),
-            model: "jev-latest".into(),
+            model: Some("jev-latest".into()),
             questions: [("framework_invoked".to_string(), Question::noul("q", None))]
                 .into_iter()
                 .collect(),
@@ -192,7 +192,7 @@ mod tests {
     }
 
     fn fast(server: &MockServer) -> Client {
-        Client::new(server.uri(), "test-key".into()).with_retry(RetryPolicy {
+        Client::new(server.uri(), Some("test-key".into())).with_retry(RetryPolicy {
             max_attempts: 4,
             base_delay: Duration::from_millis(1),
         })
@@ -333,5 +333,41 @@ mod tests {
             backoff_delay(Duration::from_secs(u64::MAX / 2), 7),
             Duration::MAX
         );
+    }
+
+    #[tokio::test]
+    async fn a_client_without_a_key_sends_no_authorization_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .mount(&server)
+            .await;
+        let c = Client::new(server.uri(), None);
+        assert!(
+            c.ask(&req()).await.is_ok(),
+            "a local server with no auth is normal"
+        );
+
+        // wiremock 0.6 has no negation matcher, so assert on what was
+        // actually sent. An absent header and an empty bearer are
+        // different things on the wire, and only one of them is correct.
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].headers.get("authorization").is_none(),
+            "no key means no header at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_with_a_key_still_sends_the_bearer_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer k"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .mount(&server)
+            .await;
+        let c = Client::new(server.uri(), Some("k".into()));
+        assert!(c.ask(&req()).await.is_ok());
     }
 }

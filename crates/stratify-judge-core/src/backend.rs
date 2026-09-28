@@ -1,5 +1,6 @@
 use crate::config::JudgeConfig;
 use serde::Deserialize;
+use systemone_client::Client;
 
 /// Which model endpoint to ask, and what it can hold.
 ///
@@ -163,6 +164,25 @@ pub fn resolve_backend(
     Ok(out)
 }
 
+/// A client for this backend, or None when it requires a key and none is
+/// set, which stays a pass-through exactly as before.
+///
+/// Deliberately not a Result: a missing key is a supported mode, not an
+/// error, and the pass-through behavior depends on it staying that way.
+///
+/// `api_key_required == false` means "send the key if one is set", not
+/// "never send one". A local laya-serve binds without auth until
+/// LAYA_API_KEY is set, and then requires the bearer header.
+pub fn client_for(b: &Backend) -> Option<Client> {
+    let key = std::env::var(&b.api_key_env)
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+    match (b.api_key_required, key) {
+        (true, None) => None,
+        (_, key) => Some(Client::new(b.url.clone(), key)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +341,22 @@ api_key_required = false
         assert_eq!(b.state_tokens, 4096, "kept from config");
         assert_eq!(b.api_key_env, "MINE_KEY", "kept from config");
         assert!(!b.api_key_required, "kept from config");
+    }
+
+    /// Review Focus 5: "not required" must mean "send it if present".
+    #[test]
+    fn a_backend_that_does_not_require_a_key_still_builds_a_client() {
+        // LAYA_API_KEY is almost certainly unset here, which is the point.
+        assert!(client_for(&Backend::laya()).is_some());
+    }
+
+    #[test]
+    fn a_backend_that_requires_a_missing_key_builds_nothing() {
+        let b = Backend {
+            api_key_env: "STRATIFY_JUDGE_KEY_THAT_IS_NOT_SET".into(),
+            api_key_required: true,
+            ..Backend::jev()
+        };
+        assert!(client_for(&b).is_none(), "stays a pass-through");
     }
 }

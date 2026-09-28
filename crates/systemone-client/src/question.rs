@@ -128,7 +128,10 @@ impl Question {
 #[derive(Debug, Clone, Serialize)]
 pub struct SystemOneRequest {
     pub state: serde_json::Value,
-    pub model: String,
+    /// Jev requires a model. Laya omits it, so an absent model must
+    /// serialize as no key at all rather than as null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub questions: BTreeMap<String, Question>,
 }
 
@@ -222,7 +225,7 @@ mod tests {
     fn request_carries_state_model_and_named_questions() {
         let req = SystemOneRequest {
             state: json!({ "finding_0": { "name": "helper" } }),
-            model: "jev-latest".into(),
+            model: Some("jev-latest".into()),
             questions: [("framework_invoked".to_string(), Question::noul("q", None))]
                 .into_iter()
                 .collect(),
@@ -231,5 +234,29 @@ mod tests {
         assert_eq!(v["model"], "jev-latest");
         assert_eq!(v["state"]["finding_0"]["name"], "helper");
         assert_eq!(v["questions"]["framework_invoked"]["type"], "noul");
+    }
+
+    #[test]
+    fn a_request_without_a_model_omits_the_key_entirely() {
+        let req = SystemOneRequest {
+            state: json!({ "finding_0": {} }),
+            model: None,
+            questions: BTreeMap::new(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(
+            v.get("model").is_none(),
+            "Laya's documented example omits model; null is not the same thing: {v}"
+        );
+    }
+
+    #[test]
+    fn a_request_with_a_model_still_sends_it() {
+        let req = SystemOneRequest {
+            state: json!({}),
+            model: Some("jev-latest".into()),
+            questions: BTreeMap::new(),
+        };
+        assert_eq!(serde_json::to_value(&req).unwrap()["model"], "jev-latest");
     }
 }

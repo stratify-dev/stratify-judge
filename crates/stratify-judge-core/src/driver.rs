@@ -244,7 +244,7 @@ impl Driver {
                 }
                 let req = SystemOneRequest {
                     state: serde_json::Value::Object(state),
-                    model: self.cfg.model.clone(),
+                    model: Some(self.cfg.model.clone()),
                     questions: qs,
                 };
                 let client = client.clone();
@@ -488,7 +488,7 @@ mod tests {
         // tokens. This is the steady state the README recommends, and a
         // plan that ignored the cache would still say one.
         let d = Driver::new(
-            Some(Client::new(server.uri(), "k".into())),
+            Some(Client::new(server.uri(), Some("k".into()))),
             cache(),
             JudgeConfig::default(),
         );
@@ -538,7 +538,7 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let client = Client::new(server.uri(), "k".into());
+        let client = Client::new(server.uri(), Some("k".into()));
         let d = Driver::new(
             Some(client),
             Cache::new(dir.path().into(), true),
@@ -573,7 +573,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let d = Driver::new(
-            Some(Client::new(server.uri(), "k".into())),
+            Some(Client::new(server.uri(), Some("k".into()))),
             Cache::new(dir.path().into(), false),
             JudgeConfig::default(),
         );
@@ -640,7 +640,7 @@ mod tests {
         let cfg = JudgeConfig::default();
         let make = || {
             Driver::new(
-                Some(Client::new(server.uri(), "k".into())),
+                Some(Client::new(server.uri(), Some("k".into()))),
                 Cache::new(dir.path().into(), true),
                 cfg.clone(),
             )
@@ -694,7 +694,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let make = || {
             Driver::new(
-                Some(Client::new(server.uri(), "k".into())),
+                Some(Client::new(server.uri(), Some("k".into()))),
                 Cache::new(dir.path().into(), true),
                 JudgeConfig::default(),
             )
@@ -755,7 +755,7 @@ mod tests {
         };
         let d = Driver::new(
             Some(
-                Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                Client::new(server.uri(), Some("k".into())).with_retry(RetryPolicy {
                     max_attempts: 1,
                     base_delay: std::time::Duration::from_millis(1),
                 }),
@@ -807,7 +807,7 @@ mod tests {
         };
         let d = Driver::new(
             Some(
-                Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                Client::new(server.uri(), Some("k".into())).with_retry(RetryPolicy {
                     max_attempts: 1,
                     base_delay: std::time::Duration::from_millis(1),
                 }),
@@ -844,7 +844,7 @@ mod tests {
         };
         let d = Driver::new(
             Some(
-                Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                Client::new(server.uri(), Some("k".into())).with_retry(RetryPolicy {
                     max_attempts: 1,
                     base_delay: std::time::Duration::from_millis(1),
                 }),
@@ -888,7 +888,7 @@ mod tests {
         r.findings[0].span.file = "no/such/file.rs".into();
 
         let d = Driver::new(
-            Some(Client::new(server.uri(), "k".into())),
+            Some(Client::new(server.uri(), Some("k".into()))),
             Cache::new(dir.path().into(), false),
             JudgeConfig::default(),
         );
@@ -912,7 +912,7 @@ mod tests {
         };
         let d = Driver::new(
             Some(
-                Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                Client::new(server.uri(), Some("k".into())).with_retry(RetryPolicy {
                     max_attempts: 2,
                     base_delay: std::time::Duration::from_millis(1),
                 }),
