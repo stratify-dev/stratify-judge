@@ -433,6 +433,44 @@ fn the_backend_flag_beats_a_config_key_naming_a_different_backend() {
         .stdout(predicates::str::contains("backend jev"));
 }
 
+/// M6: a preview must not fail a build even when the report holds a
+/// warning and the resolved backend cannot hold the request at all. Before
+/// the fix, the context-floor arm in the dry-run path returned whatever
+/// --fail-on computed, contrary to the README's "always exits 0".
+#[test]
+fn dry_run_exits_zero_even_when_the_floor_trips_and_fail_on_would_otherwise_fire() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("stratify-judge.toml"),
+        "[judge.backends.laya]\nstate_tokens = 512\n",
+    )
+    .unwrap();
+
+    let body = r#"{"schema_version":1,"findings":[{
+        "rule":"dead_code","severity":"warning",
+        "message":"possibly unused function `helper`",
+        "span":{"file":"src/lib.rs","start_byte":0,"end_byte":1,"start_line":1},
+        "confidence":"likely"
+    }]}"#;
+
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("LAYA_API_KEY")
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "--backend",
+            "laya",
+            "--fail-on",
+            "warning",
+            "--dry-run",
+        ])
+        .write_stdin(body)
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("512"));
+}
+
 /// I4: a context-floor error must not swallow the --verbose summary or the
 /// accounting for work already applied. One finding is warmed into the
 /// cache first; the second run adds an uncached finding under a budget too

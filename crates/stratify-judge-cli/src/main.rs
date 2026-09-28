@@ -199,11 +199,12 @@ async fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             Err(e) => {
-                // Same pass-through rule as every other failure: a context
-                // floor stops judging, not the report from going out.
+                // A preview gates nothing: it always exits 0, per the
+                // README's own contract, since dry-run sends nothing and
+                // has nothing to fail a build over.
                 eprintln!("stratify-judge: {e}");
                 print!("{}", render(&args, &report));
-                return exit_code(&args, &report);
+                return ExitCode::SUCCESS;
             }
         }
     }
