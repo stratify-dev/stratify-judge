@@ -174,9 +174,12 @@ pub fn resolve_backend(
 /// "never send one". A local laya-serve binds without auth until
 /// LAYA_API_KEY is set, and then requires the bearer header.
 pub fn client_for(b: &Backend) -> Option<Client> {
-    let key = std::env::var(&b.api_key_env)
-        .ok()
-        .filter(|k| !k.trim().is_empty());
+    // One definition of "usable key", shared with the client crate rather
+    // than reimplemented here. An inline `.filter(|k| !k.trim().is_empty())`
+    // would agree today and drift tomorrow, and it could only be tested by
+    // writing the process environment, which races reqwest's own
+    // proxy-variable reads on a threaded test runner.
+    let key = systemone_client::usable_key(std::env::var(&b.api_key_env).ok());
     match (b.api_key_required, key) {
         (true, None) => None,
         (_, key) => Some(Client::new(b.url.clone(), key)),

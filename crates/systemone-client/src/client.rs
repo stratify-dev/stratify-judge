@@ -52,7 +52,7 @@ fn backoff_delay(base: Duration, attempt: u32) -> Duration {
 /// reads one. An empty key is worse than no key: it would send `Bearer `
 /// and earn a 401 on every request instead of cleanly running without
 /// judgment.
-fn usable_key(raw: Option<String>) -> Option<String> {
+pub fn usable_key(raw: Option<String>) -> Option<String> {
     let key = raw?;
     if key.trim().is_empty() {
         return None;
