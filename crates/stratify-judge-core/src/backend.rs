@@ -136,14 +136,7 @@ pub fn resolve_backend(
                 api_key_required: false,
                 state_tokens: 0,
             };
-            let built = over.apply(neutral);
-            if built.url.is_empty() {
-                return Err(format!(
-                    "backend `{name}` has no url: set `url` under \
-                     [judge.backends.{name}]"
-                ));
-            }
-            built
+            over.apply(neutral)
         }
         (None, None) => {
             return Err(format!(
@@ -160,6 +153,12 @@ pub fn resolve_backend(
     }
     if let Some(m) = model_flag {
         out.model = Some(m.to_string());
+    }
+    if out.url.is_empty() {
+        return Err(format!(
+            "backend `{name}` has no url: set `url` under \
+             [judge.backends.{name}], or pass --base-url"
+        ));
     }
     Ok(out)
 }
@@ -288,5 +287,39 @@ api_key_required = false
         assert_eq!(b.url, "http://10.0.0.5:8000");
         assert_eq!(b.model, None);
         assert_eq!(b.state_tokens, 4096);
+    }
+
+    #[test]
+    fn a_config_only_backend_with_no_url_anywhere_is_an_error() {
+        let cfg: JudgeConfig = toml::from_str(
+            r#"
+[backends.mine]
+state_tokens = 4096
+"#,
+        )
+        .unwrap();
+        let err = resolve_backend("mine", &cfg, None, None).unwrap_err();
+        assert!(err.contains("mine"), "got {err}");
+        assert!(err.contains("--base-url"), "got {err}");
+        assert!(err.contains("[judge.backends.mine]"), "got {err}");
+    }
+
+    #[test]
+    fn a_url_flag_can_supply_the_url_a_config_table_omits() {
+        let cfg: JudgeConfig = toml::from_str(
+            r#"
+[backends.mine]
+state_tokens = 4096
+api_key_env = "MINE_KEY"
+api_key_required = false
+"#,
+        )
+        .unwrap();
+        let b = resolve_backend("mine", &cfg, Some("http://10.0.0.5:8000"), None).unwrap();
+        assert_eq!(b.name, "mine");
+        assert_eq!(b.url, "http://10.0.0.5:8000");
+        assert_eq!(b.state_tokens, 4096, "kept from config");
+        assert_eq!(b.api_key_env, "MINE_KEY", "kept from config");
+        assert!(!b.api_key_required, "kept from config");
     }
 }
