@@ -1,3 +1,4 @@
+use crate::backend::Backend;
 use crate::cache::{cache_key, Cache};
 use crate::config::JudgeConfig;
 use crate::context::RepoContext;
@@ -91,6 +92,7 @@ pub struct Driver {
     client: Option<Arc<Client>>,
     cache: Cache,
     cfg: JudgeConfig,
+    backend: Backend,
 }
 
 /// One finding's prepared work: its state, its cache key, and where it
@@ -103,11 +105,12 @@ struct Prepared {
 }
 
 impl Driver {
-    pub fn new(client: Option<Client>, cache: Cache, cfg: JudgeConfig) -> Driver {
+    pub fn new(client: Option<Client>, cache: Cache, cfg: JudgeConfig, backend: Backend) -> Driver {
         Driver {
             client: client.map(Arc::new),
             cache,
             cfg,
+            backend,
         }
     }
 
@@ -129,7 +132,7 @@ impl Driver {
                 let key = cache_key(
                     judge.rule(),
                     judge.version(),
-                    &self.cfg.model,
+                    &self.backend,
                     &state,
                     &questions,
                 );
@@ -179,7 +182,7 @@ impl Driver {
                 let key = cache_key(
                     judge.rule(),
                     judge.version(),
-                    &self.cfg.model,
+                    &self.backend,
                     &state,
                     &questions,
                 );
@@ -442,7 +445,12 @@ mod tests {
             batch_findings: 2,
             ..JudgeConfig::default()
         };
-        let d = Driver::new(None, Cache::new(dir.path().into(), true), cfg);
+        let d = Driver::new(
+            None,
+            Cache::new(dir.path().into(), true),
+            cfg,
+            Backend::jev(),
+        );
         // Five dead_code findings at two per batch is three requests, and
         // the token estimate is the sum of all five slots' costs.
         let (requests, tokens) = d.plan(&report(5), &ctx());
@@ -479,8 +487,8 @@ mod tests {
 
         // Before anything is cached the plan is one request, at a nonzero
         // token cost.
-        let (requests, tokens) =
-            Driver::new(None, cache(), JudgeConfig::default()).plan(&report(1), &ctx());
+        let (requests, tokens) = Driver::new(None, cache(), JudgeConfig::default(), Backend::jev())
+            .plan(&report(1), &ctx());
         assert_eq!(requests, 1);
         assert!(tokens > 0);
 
@@ -491,11 +499,13 @@ mod tests {
             Some(Client::new(server.uri(), Some("k".into()))),
             cache(),
             JudgeConfig::default(),
+            Backend::jev(),
         );
         d.run(&mut report(1), &ctx()).await;
 
         assert_eq!(
-            Driver::new(None, cache(), JudgeConfig::default()).plan(&report(1), &ctx()),
+            Driver::new(None, cache(), JudgeConfig::default(), Backend::jev())
+                .plan(&report(1), &ctx()),
             (0, 0)
         );
     }
@@ -507,6 +517,7 @@ mod tests {
             None,
             Cache::new(dir.path().into(), true),
             JudgeConfig::default(),
+            Backend::jev(),
         );
         let mut r = report(3);
         let before = r.clone();
@@ -543,6 +554,7 @@ mod tests {
             Some(client),
             Cache::new(dir.path().into(), true),
             JudgeConfig::default(),
+            Backend::jev(),
         );
 
         let mut r = report(1);
@@ -576,6 +588,7 @@ mod tests {
             Some(Client::new(server.uri(), Some("k".into()))),
             Cache::new(dir.path().into(), false),
             JudgeConfig::default(),
+            Backend::jev(),
         );
         let mut r = report(2);
         d.run(&mut r, &ctx()).await;
@@ -643,6 +656,7 @@ mod tests {
                 Some(Client::new(server.uri(), Some("k".into()))),
                 Cache::new(dir.path().into(), true),
                 cfg.clone(),
+                Backend::jev(),
             )
         };
 
@@ -697,6 +711,7 @@ mod tests {
                 Some(Client::new(server.uri(), Some("k".into()))),
                 Cache::new(dir.path().into(), true),
                 JudgeConfig::default(),
+                Backend::jev(),
             )
         };
 
@@ -762,6 +777,7 @@ mod tests {
             ),
             Cache::new(dir.path().into(), false),
             cfg,
+            Backend::jev(),
         );
 
         let mut r = report(2);
@@ -814,6 +830,7 @@ mod tests {
             ),
             Cache::new(dir.path().into(), false),
             cfg,
+            Backend::jev(),
         );
 
         let mut r = report(3);
@@ -851,6 +868,7 @@ mod tests {
             ),
             Cache::new(dir.path().into(), false),
             cfg,
+            Backend::jev(),
         );
 
         let mut r = report(4);
@@ -891,6 +909,7 @@ mod tests {
             Some(Client::new(server.uri(), Some("k".into()))),
             Cache::new(dir.path().into(), false),
             JudgeConfig::default(),
+            Backend::jev(),
         );
         let stats = d.run(&mut r, &ctx()).await;
         assert_eq!(stats.missing_sources, 1);
@@ -919,6 +938,7 @@ mod tests {
             ),
             Cache::new(dir.path().into(), true),
             cfg,
+            Backend::jev(),
         );
 
         let mut r = report(2);

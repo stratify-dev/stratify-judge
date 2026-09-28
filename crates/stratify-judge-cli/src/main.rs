@@ -4,6 +4,7 @@ use clap::{Parser, ValueEnum};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use stratify_judge_core::backend::Backend;
 use stratify_judge_core::cache::Cache;
 use stratify_judge_core::config::JudgeConfig;
 use stratify_judge_core::context::RepoContext;
@@ -151,7 +152,7 @@ async fn main() -> ExitCode {
         // takes, so a committed cache is reflected. A preview that ignores
         // the cache overstates cost in exactly the steady state the README
         // recommends.
-        let (planned, tokens) = Driver::new(None, cache, cfg).plan(&report, &ctx);
+        let (planned, tokens) = Driver::new(None, cache, cfg, Backend::jev()).plan(&report, &ctx);
         println!("{planned} request(s) planned, {tokens} tokens estimated, nothing sent.");
         return ExitCode::SUCCESS;
     }
@@ -167,7 +168,7 @@ async fn main() -> ExitCode {
             );
         }
         Some(client) => {
-            let driver = Driver::new(Some(client), cache, cfg);
+            let driver = Driver::new(Some(client), cache, cfg, Backend::jev());
             let stats = driver.run(&mut report, &ctx).await;
             if args.verbose {
                 eprintln!(
