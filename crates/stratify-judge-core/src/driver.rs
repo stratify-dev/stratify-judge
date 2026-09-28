@@ -247,7 +247,14 @@ impl Driver {
                 }
                 let req = SystemOneRequest {
                     state: serde_json::Value::Object(state),
-                    model: Some(self.cfg.model.clone()),
+                    // The backend owns which model to ask. Reading cfg here
+                    // while the cache key reads the backend would let a
+                    // request go to one model and its answer be filed under
+                    // another's key, in a cache meant to be committed. It is
+                    // also already Option, so a backend with no model omits
+                    // the field rather than sending a name the endpoint does
+                    // not know.
+                    model: self.backend.model.clone(),
                     questions: qs,
                 };
                 let client = client.clone();
@@ -340,7 +347,10 @@ impl Driver {
         let mut judgment: Judgment = judge.judge(finding, answers, &self.cfg.thresholds);
         if judgment.model.is_empty() {
             judgment.model = if model.is_empty() {
-                self.cfg.model.clone()
+                self.backend
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| self.backend.name.clone())
             } else {
                 model.to_string()
             };
@@ -948,5 +958,73 @@ mod tests {
         assert_eq!(stats.failed, 1);
         assert_eq!(stats.judged, 0);
         assert_eq!(r, before);
+    }
+
+    /// The request must name the model the cache key hashes. When these
+    /// disagree, an answer from one model is filed under another's key, and
+    /// the cache is meant to be committed, so the mismatch outlives the run.
+    #[tokio::test]
+    async fn the_request_carries_the_backends_model_not_the_configs() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "jev-1.13.0",
+                "answers": {},
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = Backend {
+            model: Some("jev-preview".into()),
+            ..Backend::jev()
+        };
+        let d = Driver::new(
+            Some(Client::new(server.uri(), Some("k".into()))),
+            Cache::new(dir.path().into(), false),
+            JudgeConfig::default(),
+            pinned,
+        );
+        d.run(&mut report(1), &ctx()).await;
+
+        let sent = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(
+            body["model"], "jev-preview",
+            "the backend's model, not the config's"
+        );
+    }
+
+    /// A backend with no model omits the field entirely. Laya's documented
+    /// request has no `model` key, and sending one names an endpoint it does
+    /// not know.
+    #[tokio::test]
+    async fn a_backend_without_a_model_omits_the_field() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "laya-1",
+                "answers": {},
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let d = Driver::new(
+            Some(Client::new(server.uri(), None)),
+            Cache::new(dir.path().into(), false),
+            JudgeConfig::default(),
+            Backend {
+                url: server.uri(),
+                ..Backend::laya()
+            },
+        );
+        d.run(&mut report(1), &ctx()).await;
+
+        let sent = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert!(body.get("model").is_none(), "no model key at all: {body}");
     }
 }

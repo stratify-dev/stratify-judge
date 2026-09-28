@@ -57,10 +57,14 @@ reviewable diff of verdicts.
 The cache directory is resolved against the current directory, not `--root`,
 so it never lands as untracked files inside the repository being analysed.
 
-The cache key hashes the configured model alias (`jev-latest` by default),
-not the concrete model that actually answered, which the entry records
-separately. This is deliberate for CI: a cached answer stays a hit even
-after TypeSafe moves `jev-latest` to a newer version, so results do not
+The cache key hashes the backend name and the backend's model. An answer from
+Jev and an answer from Laya never share a key, so switching `--backend` does
+not cause a stale cache hit. The entry records the concrete model that actually
+answered separately, in case that differs from the request.
+
+The model is tagged in the hash so an absent model (Laya) and an empty string
+are different inputs. This is deliberate for CI: a cached answer stays a hit
+even after TypeSafe moves `jev-latest` to a newer version, so results do not
 silently shift between runs. The cost is that moving the alias does not, by
 itself, cause anything to be re-asked. To force a re-ask after a model or
 question change, bump the judge's `version()`, which changes every cache key

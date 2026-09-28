@@ -1,9 +1,6 @@
 use serde::Deserialize;
 use std::path::Path;
 
-fn d_model() -> String {
-    "jev-latest".to_string()
-}
 fn d_concurrency() -> usize {
     8
 }
@@ -68,8 +65,6 @@ pub struct Thresholds {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct JudgeConfig {
-    #[serde(default = "d_model")]
-    pub model: String,
     #[serde(default = "d_concurrency")]
     pub concurrency: usize,
     #[serde(default = "d_batch_findings")]
@@ -86,7 +81,6 @@ pub struct JudgeConfig {
 impl Default for JudgeConfig {
     fn default() -> Self {
         JudgeConfig {
-            model: d_model(),
             concurrency: d_concurrency(),
             batch_findings: d_batch_findings(),
             batch_files: d_batch_files(),
@@ -131,7 +125,6 @@ mod tests {
     fn defaults_match_the_spec_when_no_config_exists() {
         let dir = tempfile::tempdir().unwrap();
         let c = JudgeConfig::load(dir.path());
-        assert_eq!(c.model, "jev-latest");
         assert_eq!(c.concurrency, 8);
         assert_eq!(c.batch_findings, 10);
         assert_eq!(c.thresholds.dead_code.dismiss_at, 0.75);
@@ -163,7 +156,6 @@ dismiss_at = 0.9
         assert_eq!(c.thresholds.dead_code.dismiss_at, 0.9);
         // Unset keys keep their defaults.
         assert_eq!(c.thresholds.dead_code.api_at, 0.75);
-        assert_eq!(c.model, "jev-latest");
     }
 
     #[test]
