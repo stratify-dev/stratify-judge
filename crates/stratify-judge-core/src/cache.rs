@@ -1,9 +1,10 @@
-use jev_client::{Answer, Question, Usage};
+use crate::backend::Backend;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
+use systemone_client::{Answer, Question, Usage};
 
 /// One cached finding's answers. Raw answers only, never verdicts, so a
 /// threshold change re-scores from disk with no network call.
@@ -22,14 +23,28 @@ pub struct Entry {
 pub fn cache_key(
     judge: &str,
     version: u32,
-    model: &str,
+    backend: &Backend,
     state: &serde_json::Value,
     questions: &BTreeMap<String, Question>,
 ) -> String {
     let mut h = Sha256::new();
     feed(&mut h, judge.as_bytes());
     h.update(version.to_le_bytes()); // fixed width, needs no framing
-    feed(&mut h, model.as_bytes());
+
+    // The backend identifies the model that answered, and the endpoint it
+    // answered from. Without both, a committed cache would serve one
+    // model's verdicts to another's run, or one endpoint's answers under
+    // a name that no longer names where they came from.
+    feed(&mut h, backend.name.as_bytes());
+    feed(&mut h, backend.url.as_bytes());
+    // Tagged, so an absent model and an empty one are different inputs.
+    match &backend.model {
+        Some(m) => {
+            h.update([1u8]);
+            feed(&mut h, m.as_bytes());
+        }
+        None => h.update([0u8]),
+    }
     feed(&mut h, &serde_json::to_vec(state).unwrap_or_default());
     feed(&mut h, &serde_json::to_vec(questions).unwrap_or_default());
     format!("{:x}", h.finalize())
@@ -109,8 +124,9 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jev_client::{Answer, Question, Usage};
+    use crate::backend::Backend;
     use serde_json::json;
+    use systemone_client::{Answer, Question, Usage};
 
     fn questions() -> BTreeMap<String, Question> {
         [("framework_invoked".to_string(), Question::noul("q", None))]
@@ -127,8 +143,8 @@ mod tests {
     #[test]
     fn key_is_stable_for_identical_inputs() {
         let s = json!({ "name": "helper" });
-        let a = cache_key("dead_code", 1, "jev-latest", &s, &questions());
-        let b = cache_key("dead_code", 1, "jev-latest", &s, &questions());
+        let a = cache_key("dead_code", 1, &Backend::jev(), &s, &questions());
+        let b = cache_key("dead_code", 1, &Backend::jev(), &s, &questions());
         assert_eq!(a, b);
         assert_eq!(a.len(), 64);
     }
@@ -136,34 +152,43 @@ mod tests {
     #[test]
     fn key_changes_when_any_input_changes() {
         let s = json!({ "name": "helper" });
-        let base = cache_key("dead_code", 1, "jev-latest", &s, &questions());
+        let base = cache_key("dead_code", 1, &Backend::jev(), &s, &questions());
         // A different judge must never collide with this one. Two judges
         // sharing a key would serve one judge's verdict to the other.
         assert_ne!(
             base,
-            cache_key("duplication", 1, "jev-latest", &s, &questions())
+            cache_key("duplication", 1, &Backend::jev(), &s, &questions())
         );
         assert_ne!(
             base,
-            cache_key("dead_code", 2, "jev-latest", &s, &questions())
-        );
-        assert_ne!(
-            base,
-            cache_key("dead_code", 1, "jev-1.13.0", &s, &questions())
+            cache_key("dead_code", 2, &Backend::jev(), &s, &questions())
         );
         assert_ne!(
             base,
             cache_key(
                 "dead_code",
                 1,
-                "jev-latest",
+                &Backend {
+                    model: Some("jev-1.13.0".into()),
+                    ..Backend::jev()
+                },
+                &s,
+                &questions()
+            )
+        );
+        assert_ne!(
+            base,
+            cache_key(
+                "dead_code",
+                1,
+                &Backend::jev(),
                 &json!({ "name": "other" }),
                 &questions()
             )
         );
         let mut q2 = questions();
         q2.insert("test_only".into(), Question::noul("q2", None));
-        assert_ne!(base, cache_key("dead_code", 1, "jev-latest", &s, &q2));
+        assert_ne!(base, cache_key("dead_code", 1, &Backend::jev(), &s, &q2));
     }
 
     #[test]
@@ -224,5 +249,52 @@ mod tests {
         )
         .unwrap();
         assert!(c.get(&key).is_none());
+    }
+
+    /// Review Focus 4: the cache is designed to be committed, so a
+    /// cross-backend hit would serve verdicts from a model the user did
+    /// not run.
+    #[test]
+    fn two_backends_never_share_a_key() {
+        let s = json!({ "name": "helper" });
+        let q = questions();
+        let jev = cache_key("dead_code", 1, &Backend::jev(), &s, &q);
+        let laya = cache_key("dead_code", 1, &Backend::laya(), &s, &q);
+        assert_ne!(jev, laya);
+
+        // Same name, different model id: still distinct.
+        let pinned = Backend {
+            model: Some("jev-1.13.0".into()),
+            ..Backend::jev()
+        };
+        assert_ne!(jev, cache_key("dead_code", 1, &pinned, &s, &q));
+
+        // An absent model must not hash the same as an empty one.
+        let empty = Backend {
+            model: Some(String::new()),
+            ..Backend::laya()
+        };
+        assert_ne!(laya, cache_key("dead_code", 1, &empty, &s, &q));
+    }
+
+    /// I2: `--base-url` changes which model answers without changing the
+    /// backend's name, so the url has to be part of the key too, or a
+    /// committed cache would serve one endpoint's answers to another's run.
+    #[test]
+    fn two_backends_identical_except_for_url_produce_different_keys() {
+        let s = json!({ "name": "helper" });
+        let q = questions();
+        let a = cache_key("dead_code", 1, &Backend::jev(), &s, &q);
+        let b = cache_key(
+            "dead_code",
+            1,
+            &Backend {
+                url: "http://127.0.0.1:9999".into(),
+                ..Backend::jev()
+            },
+            &s,
+            &q,
+        );
+        assert_ne!(a, b, "same name and model, different url, must differ");
     }
 }

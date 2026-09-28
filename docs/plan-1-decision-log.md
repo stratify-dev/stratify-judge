@@ -11,6 +11,10 @@ copy of the engine repo as
 that cite a task number or a brief refer to those files. The rulings themselves
 stand on their own: each says what was decided, why, and what it costs if wrong.
 
+This log predates the rename to `stratify-judge`. Where it says `stratify-jev`,
+`jev-client` or `stratify-jev-judge`, read `stratify-judge`, `systemone-client`
+and `stratify-judge-core`. The rulings themselves are unaffected.
+
 ---
 
 # SDD ledger — plan: docs/superpowers/plans/2026-09-20-stratify-jev-p1-skeleton.md

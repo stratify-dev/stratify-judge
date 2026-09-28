@@ -1,4 +1,4 @@
-use stratify_jev_judge::model::{Confidence, Finding, Report, Severity};
+use stratify_judge_core::model::{Confidence, Finding, Report, Severity};
 
 /// A finding is shown when its confidence reaches the threshold, or when
 /// the caller asked to see everything.
@@ -16,6 +16,19 @@ fn label(s: Severity) -> &'static str {
 
 fn reason_of(f: &Finding) -> Option<&str> {
     f.extra.get("judgment")?.get("reason")?.as_str()
+}
+
+/// The model that actually produced the judgment, whatever backend it
+/// came from. `apply_one` always records a concrete model, and a cache
+/// hit's entry carries the model that produced it, so this is the sibling
+/// of `reason_of`'s read. Never a hardcoded vendor name: an absent or
+/// unreadable model falls back to the neutral `judge` label instead.
+fn model_of(f: &Finding) -> Option<&str> {
+    f.extra
+        .get("judgment")?
+        .get("model")?
+        .as_str()
+        .filter(|m| !m.is_empty())
 }
 
 /// Human output keeps the engine's line shape and adds a reason under
@@ -37,7 +50,8 @@ pub fn render(report: &Report, min: Confidence, show_dismissed: bool) -> String 
             f.message
         ));
         if let Some(r) = reason_of(f) {
-            out.push_str(&format!("      jev: {r}\n"));
+            let model = model_of(f).unwrap_or("judge");
+            out.push_str(&format!("      {model}: {r}\n"));
         }
     }
 
@@ -61,7 +75,7 @@ pub fn render(report: &Report, min: Confidence, show_dismissed: bool) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stratify_jev_judge::model::{Confidence, Finding, Report, Severity, Span};
+    use stratify_judge_core::model::{Confidence, Finding, Report, Severity, Span};
 
     fn finding(conf: Confidence, judged: bool) -> Finding {
         let mut extra = serde_json::Map::new();
@@ -70,7 +84,8 @@ mod tests {
                 "judgment".into(),
                 serde_json::json!({
                     "verdict": "dismiss",
-                    "reason": "reached by a framework (0.91)"
+                    "reason": "reached by a framework (0.91)",
+                    "model": "jev-1.13.0"
                 }),
             );
         }
@@ -119,7 +134,56 @@ mod tests {
         let r = report(vec![finding(Confidence::Likely, true)]);
         let out = render(&r, Confidence::Unknown, false);
         assert!(
-            out.contains("jev: reached by a framework (0.91)"),
+            out.contains("jev-1.13.0: reached by a framework (0.91)"),
+            "got:\n{out}"
+        );
+    }
+
+    /// I1: the label must be the model that actually answered, not a
+    /// hardcoded vendor name. A judgment recorded under Laya must render
+    /// under Laya's name, never under `jev`.
+    #[test]
+    fn a_judgment_recorded_under_a_non_jev_model_renders_under_that_models_name() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "judgment".into(),
+            serde_json::json!({
+                "verdict": "dismiss",
+                "reason": "reached by a framework (0.95)",
+                "model": "laya-1"
+            }),
+        );
+        let f = Finding {
+            extra,
+            ..finding(Confidence::Likely, false)
+        };
+        let out = render(&report(vec![f]), Confidence::Unknown, false);
+        assert!(
+            out.contains("laya-1: reached by a framework (0.95)"),
+            "got:\n{out}"
+        );
+        assert!(!out.contains("jev:"), "must not default to a vendor name");
+    }
+
+    /// RULING (I1): absent or unreadable falls back to the neutral `judge`
+    /// label, never a hardcoded model id.
+    #[test]
+    fn a_missing_model_falls_back_to_the_neutral_judge_label() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "judgment".into(),
+            serde_json::json!({
+                "verdict": "dismiss",
+                "reason": "reached by a framework (0.5)"
+            }),
+        );
+        let f = Finding {
+            extra,
+            ..finding(Confidence::Likely, false)
+        };
+        let out = render(&report(vec![f]), Confidence::Unknown, false);
+        assert!(
+            out.contains("judge: reached by a framework (0.5)"),
             "got:\n{out}"
         );
     }

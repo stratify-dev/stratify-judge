@@ -162,3 +162,15 @@ The claim worth leading with is the measured one: on the engine's own repository
 - **The rename touches every file.** Mitigated by doing it as one mechanical commit with no behavioral change, verified by the suite passing before and after.
 - **Laya is unverified end to end.** The protocol compatibility is documented, not measured. The first real run against `laya-serve` may surface shape differences the docs do not mention, and `ClientError` now reaches the user, so those will be legible.
 - **A committed cache predates the backend in its key.** Every existing entry was written without a backend component and will miss once the key changes. That is correct, not a regression: those answers came from Jev and should be re-asked or re-keyed rather than silently reused.
+
+## Implementation deviations
+
+1. `Backend.name` never becomes `"custom"`. The cache key includes
+   `backend.url` instead, which meets the same goal.
+2. `Client::for_backend` became `backend::client_for` in
+   `stratify-judge-core`, because the client crate must not depend on the
+   core crate.
+3. The context-floor error passes the report through and lets `--fail-on`
+   decide, rather than exiting non-zero unconditionally. The spec's own
+   next clause ("consistent with every other failure path") argues for
+   this.

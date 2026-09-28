@@ -34,7 +34,7 @@ fn ok_answer_body() -> serde_json::Value {
 
 #[test]
 fn without_an_api_key_the_report_passes_through_and_exits_zero() {
-    let out = Command::cargo_bin("stratify-jev")
+    let out = Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args([
@@ -62,7 +62,7 @@ fn without_an_api_key_the_report_passes_through_and_exits_zero() {
 /// notice stdout is empty and --fail-on never still failed.
 #[test]
 fn an_unreadable_root_still_passes_the_report_through() {
-    let out = Command::cargo_bin("stratify-jev")
+    let out = Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args(["--root", "/no/such/directory/anywhere", "--format", "json"])
@@ -81,7 +81,7 @@ fn an_unreadable_root_still_passes_the_report_through() {
 
 #[test]
 fn an_unreadable_root_respects_fail_on_never() {
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args([
@@ -98,7 +98,7 @@ fn an_unreadable_root_respects_fail_on_never() {
 
 #[test]
 fn a_missing_key_warns_on_stderr_without_failing() {
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args(["--root", fixtures().join("sample-repo").to_str().unwrap()])
@@ -110,7 +110,7 @@ fn a_missing_key_warns_on_stderr_without_failing() {
 
 #[test]
 fn dry_run_reports_planned_requests_and_sends_nothing() {
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env("TYPESAFE_API_KEY", "not-a-real-key")
         .args([
@@ -126,7 +126,7 @@ fn dry_run_reports_planned_requests_and_sends_nothing() {
 
 #[test]
 fn fail_on_warning_exits_nonzero_when_a_warning_survives() {
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args([
@@ -150,7 +150,7 @@ async fn an_auth_failure_names_authentication_not_just_a_count() {
         .mount(&server)
         .await;
 
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env("TYPESAFE_API_KEY", "obviously-not-a-real-key")
         .args([
@@ -183,7 +183,7 @@ async fn a_root_mismatched_with_the_report_warns_about_it() {
     // test does not leave a stray .stratify/ next to the crate's sources.
     let cache_dir = tempfile::tempdir().unwrap();
 
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env("TYPESAFE_API_KEY", "test-key")
         .args([
@@ -211,7 +211,7 @@ fn show_dismissed_does_not_change_the_exit_code() {
         "confidence":"unknown"
     }]}"#;
 
-    let without = Command::cargo_bin("stratify-jev")
+    let without = Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args([
@@ -222,7 +222,7 @@ fn show_dismissed_does_not_change_the_exit_code() {
         ])
         .write_stdin(body)
         .assert();
-    let with_show = Command::cargo_bin("stratify-jev")
+    let with_show = Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args([
@@ -246,7 +246,7 @@ fn show_dismissed_does_not_change_the_exit_code() {
 /// request count.
 #[test]
 fn dry_run_reports_a_token_estimate_too() {
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env("TYPESAFE_API_KEY", "not-a-real-key")
         .args([
@@ -273,7 +273,7 @@ async fn the_cache_lands_under_the_current_directory_not_root() {
         .await;
 
     let cwd = tempfile::tempdir().unwrap();
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .current_dir(cwd.path())
         .env("TYPESAFE_API_KEY", "test-key")
@@ -288,7 +288,7 @@ async fn the_cache_lands_under_the_current_directory_not_root() {
         .success();
 
     assert!(
-        cwd.path().join(".stratify/jev-cache").exists(),
+        cwd.path().join(".stratify/judge-cache").exists(),
         "cache must land under the current directory"
     );
     assert!(
@@ -300,7 +300,7 @@ async fn the_cache_lands_under_the_current_directory_not_root() {
 #[test]
 fn an_unknown_schema_version_passes_through_with_a_warning() {
     let body = r#"{"schema_version":99,"findings":[]}"#;
-    Command::cargo_bin("stratify-jev")
+    Command::cargo_bin("stratify-judge")
         .unwrap()
         .env_remove("TYPESAFE_API_KEY")
         .args(["--root", fixtures().join("sample-repo").to_str().unwrap()])
@@ -308,4 +308,255 @@ fn an_unknown_schema_version_passes_through_with_a_warning() {
         .assert()
         .success()
         .stderr(predicates::str::contains("schema_version 99"));
+}
+
+/// Review Focus 1: pointing --base-url at another model without
+/// --backend keeps the default backend's rules. That is defensible, but
+/// only if the tool says which backend it resolved.
+#[test]
+fn dry_run_names_the_backend_it_resolved() {
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("TYPESAFE_API_KEY")
+        .args([
+            "--root",
+            fixtures().join("sample-repo").to_str().unwrap(),
+            "--base-url",
+            "http://127.0.0.1:8000",
+            "--dry-run",
+        ])
+        .write_stdin(report_json())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("backend jev"))
+        .stdout(predicates::str::contains("http://127.0.0.1:8000"));
+}
+
+#[test]
+fn the_laya_backend_needs_no_key_to_get_past_the_client_check() {
+    // No LAYA_API_KEY, and laya does not require one, so this must reach
+    // the request stage and fail there rather than passing through as
+    // "no key configured".
+    //
+    // Deferred-minor 4: a tempdir, not a shared /tmp path other test runs
+    // could race on. The default RetryPolicy against an unreachable
+    // 127.0.0.1:1 still sleeps through its 500+1000+2000ms backoff here,
+    // most of this file's runtime; JudgeConfig exposes no retry or backoff
+    // knob to shorten it from a test config, so that timing is left alone.
+    let cache_dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("LAYA_API_KEY")
+        .args([
+            "--root",
+            fixtures().join("sample-repo").to_str().unwrap(),
+            "--backend",
+            "laya",
+            "--base-url",
+            "http://127.0.0.1:1",
+            "--cache-dir",
+            cache_dir.path().to_str().unwrap(),
+        ])
+        .write_stdin(report_json())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("request(s) failed"));
+}
+
+#[test]
+fn an_unknown_backend_fails_with_a_message_naming_both_places() {
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .args([
+            "--root",
+            fixtures().join("sample-repo").to_str().unwrap(),
+            "--backend",
+            "mistral",
+        ])
+        .write_stdin(report_json())
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("judge.backends.mistral"));
+}
+
+#[test]
+fn a_missing_key_names_the_backends_own_env_var() {
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("TYPESAFE_API_KEY")
+        .args(["--root", fixtures().join("sample-repo").to_str().unwrap()])
+        .write_stdin(report_json())
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("TYPESAFE_API_KEY"));
+}
+
+/// I3: `[judge] backend = "laya"` in config must route --dry-run to that
+/// backend when --backend is not passed on the CLI. Before the fix,
+/// `JudgeConfig` had no field for the key, so it was dropped without a
+/// word and the run went to jev instead.
+#[test]
+fn a_config_backend_key_routes_dry_run_without_a_flag() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("stratify-judge.toml"),
+        "[judge]\nbackend = \"laya\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("LAYA_API_KEY")
+        .args(["--root", root.path().to_str().unwrap(), "--dry-run"])
+        .write_stdin(report_json())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("backend laya"));
+}
+
+/// I3: the flag beats the config key when both name a backend.
+#[test]
+fn the_backend_flag_beats_a_config_key_naming_a_different_backend() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("stratify-judge.toml"),
+        "[judge]\nbackend = \"laya\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("TYPESAFE_API_KEY")
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "--backend",
+            "jev",
+            "--dry-run",
+        ])
+        .write_stdin(report_json())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("backend jev"));
+}
+
+/// M6: a preview must not fail a build even when the report holds a
+/// warning and the resolved backend cannot hold the request at all. Before
+/// the fix, the context-floor arm in the dry-run path returned whatever
+/// --fail-on computed, contrary to the README's "always exits 0".
+#[test]
+fn dry_run_exits_zero_even_when_the_floor_trips_and_fail_on_would_otherwise_fire() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("stratify-judge.toml"),
+        "[judge.backends.laya]\nstate_tokens = 512\n",
+    )
+    .unwrap();
+
+    let body = r#"{"schema_version":1,"findings":[{
+        "rule":"dead_code","severity":"warning",
+        "message":"possibly unused function `helper`",
+        "span":{"file":"src/lib.rs","start_byte":0,"end_byte":1,"start_line":1},
+        "confidence":"likely"
+    }]}"#;
+
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("LAYA_API_KEY")
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "--backend",
+            "laya",
+            "--fail-on",
+            "warning",
+            "--dry-run",
+        ])
+        .write_stdin(body)
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("512"));
+}
+
+/// I4: a context-floor error must not swallow the --verbose summary or the
+/// accounting for work already applied. One finding is warmed into the
+/// cache first; the second run adds an uncached finding under a budget too
+/// small to hold it, and the warm entry's stats must still reach stderr
+/// alongside the floor error.
+#[tokio::test]
+async fn a_floor_error_still_prints_the_verbose_summary_for_what_already_applied() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_answer_body()))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+
+    let warm_body = r#"{"schema_version":1,"findings":[{
+        "rule":"dead_code","severity":"info",
+        "message":"possibly unused function `warm`",
+        "span":{"file":"src/lib.rs","start_byte":0,"end_byte":10,"start_line":1},
+        "confidence":"likely"
+    }]}"#;
+    let both_body = r#"{"schema_version":1,"findings":[{
+        "rule":"dead_code","severity":"info",
+        "message":"possibly unused function `warm`",
+        "span":{"file":"src/lib.rs","start_byte":0,"end_byte":10,"start_line":1},
+        "confidence":"likely"
+    },{
+        "rule":"dead_code","severity":"info",
+        "message":"possibly unused function `cold`",
+        "span":{"file":"src/lib.rs","start_byte":20,"end_byte":30,"start_line":5},
+        "confidence":"likely"
+    }]}"#;
+
+    // Warm the cache for one finding at Laya's full 8,192-token budget, so
+    // the request actually succeeds and the answer lands on disk.
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("LAYA_API_KEY")
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "--backend",
+            "laya",
+            "--base-url",
+            &server.uri(),
+            "--cache-dir",
+            cache_dir.path().to_str().unwrap(),
+        ])
+        .write_stdin(warm_body)
+        .assert()
+        .success();
+
+    // Now shrink Laya's budget below what the second, uncached finding
+    // needs. The cache key does not include state_tokens, so the warm
+    // entry still hits; only the new finding trips the floor.
+    std::fs::write(
+        root.path().join("stratify-judge.toml"),
+        "[judge.backends.laya]\nstate_tokens = 512\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("LAYA_API_KEY")
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "--backend",
+            "laya",
+            "--base-url",
+            &server.uri(),
+            "--cache-dir",
+            cache_dir.path().to_str().unwrap(),
+            "--verbose",
+        ])
+        .write_stdin(both_body)
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("512"))
+        .stderr(predicates::str::contains("1 from cache"));
 }

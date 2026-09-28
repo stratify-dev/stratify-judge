@@ -1,9 +1,6 @@
 use crate::{SystemOneRequest, SystemOneResponse};
 use std::time::Duration;
 
-pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
-pub const ENV_API_KEY: &str = "TYPESAFE_API_KEY";
-
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("invalid or missing API key")]
@@ -52,7 +49,7 @@ fn backoff_delay(base: Duration, attempt: u32) -> Duration {
 /// reads one. An empty key is worse than no key: it would send `Bearer `
 /// and earn a 401 on every request instead of cleanly running without
 /// judgment.
-fn usable_key(raw: Option<String>) -> Option<String> {
+pub fn usable_key(raw: Option<String>) -> Option<String> {
     let key = raw?;
     if key.trim().is_empty() {
         return None;
@@ -60,24 +57,17 @@ fn usable_key(raw: Option<String>) -> Option<String> {
     Some(key)
 }
 
-/// Shared by `from_env` and `from_env_at`: build a client from a base URL
-/// and a raw key, applying `usable_key`'s rule. The key is a parameter
-/// rather than an environment read so this stays testable without
-/// mutating process-global state.
-fn from_key(base: impl Into<String>, raw_key: Option<String>) -> Option<Client> {
-    let key = usable_key(raw_key)?;
-    Some(Client::new(base.into(), key))
-}
-
 pub struct Client {
     http: reqwest::Client,
     base: String,
-    key: String,
+    /// None for an endpoint that needs no auth, such as a local
+    /// laya-serve without LAYA_API_KEY set.
+    key: Option<String>,
     retry: RetryPolicy,
 }
 
 impl Client {
-    pub fn new(base: String, key: String) -> Client {
+    pub fn new(base: String, key: Option<String>) -> Client {
         Client {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
@@ -87,18 +77,6 @@ impl Client {
             key,
             retry: RetryPolicy::default(),
         }
-    }
-
-    /// None when TYPESAFE_API_KEY is unset, empty, or whitespace only. The
-    /// caller treats that as "run without judgment", never as an error.
-    pub fn from_env() -> Option<Client> {
-        Client::from_env_at(DEFAULT_BASE_URL)
-    }
-
-    /// Like `from_env`, against a different base URL. For pointing the tool
-    /// at a capture proxy or a local mock when diagnosing a live run.
-    pub fn from_env_at(base: impl Into<String>) -> Option<Client> {
-        from_key(base, std::env::var(ENV_API_KEY).ok())
     }
 
     pub fn with_retry(mut self, retry: RetryPolicy) -> Client {
@@ -113,13 +91,11 @@ impl Client {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let sent = self
-                .http
-                .post(&url)
-                .bearer_auth(&self.key)
-                .json(req)
-                .send()
-                .await;
+            let mut request = self.http.post(&url).json(req);
+            if let Some(k) = &self.key {
+                request = request.bearer_auth(k);
+            }
+            let sent = request.send().await;
 
             let resp = match sent {
                 Ok(r) => r,
@@ -176,7 +152,7 @@ mod tests {
     fn req() -> SystemOneRequest {
         SystemOneRequest {
             state: json!({ "finding_0": { "name": "helper" } }),
-            model: "jev-latest".into(),
+            model: Some("jev-latest".into()),
             questions: [("framework_invoked".to_string(), Question::noul("q", None))]
                 .into_iter()
                 .collect(),
@@ -192,7 +168,7 @@ mod tests {
     }
 
     fn fast(server: &MockServer) -> Client {
-        Client::new(server.uri(), "test-key".into()).with_retry(RetryPolicy {
+        Client::new(server.uri(), Some("test-key".into())).with_retry(RetryPolicy {
             max_attempts: 4,
             base_delay: Duration::from_millis(1),
         })
@@ -269,35 +245,6 @@ mod tests {
         }
     }
 
-    /// `from_env_at` is a thin wrapper over `from_key` and `usable_key`, so
-    /// it is tested by driving `from_key` directly with an explicit key
-    /// rather than through the process environment: mutating
-    /// `TYPESAFE_API_KEY` in a test would race every other test in this
-    /// module that builds a `reqwest::Client` concurrently, since cargo
-    /// runs tests across threads and reqwest reads proxy environment
-    /// variables during construction. That is exactly the hazard removed
-    /// below by deleting `from_env_is_none_without_a_key`.
-    #[test]
-    fn from_key_is_none_without_a_usable_key() {
-        assert!(from_key("https://example.test", None).is_none());
-    }
-
-    #[tokio::test]
-    async fn from_key_targets_the_given_base_url() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/systemone"))
-            .and(header("authorization", "Bearer test-key"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
-            .mount(&server)
-            .await;
-
-        let client =
-            from_key(server.uri(), Some("test-key".into())).expect("a usable key builds a client");
-        let got = client.ask(&req()).await.unwrap();
-        assert_eq!(got.model, "jev-1.13.0");
-    }
-
     #[test]
     fn a_key_that_is_absent_empty_or_whitespace_is_not_usable() {
         assert_eq!(usable_key(None), None);
@@ -333,5 +280,41 @@ mod tests {
             backoff_delay(Duration::from_secs(u64::MAX / 2), 7),
             Duration::MAX
         );
+    }
+
+    #[tokio::test]
+    async fn a_client_without_a_key_sends_no_authorization_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .mount(&server)
+            .await;
+        let c = Client::new(server.uri(), None);
+        assert!(
+            c.ask(&req()).await.is_ok(),
+            "a local server with no auth is normal"
+        );
+
+        // wiremock 0.6 has no negation matcher, so assert on what was
+        // actually sent. An absent header and an empty bearer are
+        // different things on the wire, and only one of them is correct.
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].headers.get("authorization").is_none(),
+            "no key means no header at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_with_a_key_still_sends_the_bearer_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer k"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .mount(&server)
+            .await;
+        let c = Client::new(server.uri(), Some("k".into()));
+        assert!(c.ask(&req()).await.is_ok());
     }
 }

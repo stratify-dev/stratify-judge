@@ -59,7 +59,7 @@ cd ~/dev/stratify-jev
 cargo test 2>&1 | grep "^test result" | tee /tmp/baseline.txt
 ```
 
-Expected: four `ok` lines totalling 118 passed. Keep this file; Step 6 compares against it.
+Expected: six `test result: ok` lines, four carrying tests, 118 passed in total. Keep this file; Step 6 diffs against it. The diff is the check, not the count in this sentence.
 
 - [ ] **Step 2: Move the directories with git**
 
@@ -224,10 +224,12 @@ mod tests {
 
     #[test]
     fn config_overlays_the_preset_and_flags_overlay_config() {
+        // JudgeConfig is the inner type, so its own TOML carries no
+        // [judge] header. Production reads that header through the wrapper
+        // in JudgeConfig::load; these tests exercise the inner shape.
         let cfg: JudgeConfig = toml::from_str(
             r#"
-[judge]
-[judge.backends.laya]
+[backends.laya]
 state_tokens = 1024
 "#,
         )
@@ -263,11 +265,42 @@ state_tokens = 1024
     }
 
     #[test]
+    fn a_config_only_backend_with_no_url_anywhere_is_an_error() {
+        let cfg: JudgeConfig = toml::from_str(
+            r#"
+[backends.mine]
+state_tokens = 4096
+"#,
+        )
+        .unwrap();
+        let err = resolve_backend("mine", &cfg, None, None).unwrap_err();
+        assert!(err.contains("no url"), "got {err}");
+        assert!(err.contains("--base-url"), "says how to supply one: {err}");
+    }
+
+    #[test]
+    fn a_url_flag_can_supply_the_url_a_config_table_omits() {
+        // A table that sets only a budget is a reasonable thing to write:
+        // the endpoint's capacity is stable while its address moves between
+        // environments. The url check therefore runs after the flags.
+        let cfg: JudgeConfig = toml::from_str(
+            r#"
+[backends.mine]
+state_tokens = 4096
+"#,
+        )
+        .unwrap();
+        let b = resolve_backend("mine", &cfg, Some("http://10.0.0.9:8000"), None).unwrap();
+        assert_eq!(b.url, "http://10.0.0.9:8000");
+        assert_eq!(b.state_tokens, 4096, "the table's budget survives");
+        assert_eq!(b.name, "mine");
+    }
+
+    #[test]
     fn a_config_only_backend_needs_no_preset() {
         let cfg: JudgeConfig = toml::from_str(
             r#"
-[judge]
-[judge.backends.mine]
+[backends.mine]
 url = "http://10.0.0.5:8000"
 state_tokens = 4096
 api_key_env = "MINE_KEY"
@@ -432,14 +465,7 @@ pub fn resolve_backend(
                 api_key_required: false,
                 state_tokens: 0,
             };
-            let built = over.apply(neutral);
-            if built.url.is_empty() {
-                return Err(format!(
-                    "backend `{name}` has no url: set `url` under \
-                     [judge.backends.{name}]"
-                ));
-            }
-            built
+            over.apply(neutral)
         }
         (None, None) => {
             return Err(format!(
@@ -456,6 +482,16 @@ pub fn resolve_backend(
     }
     if let Some(m) = model_flag {
         out.model = Some(m.to_string());
+    }
+    // Checked after the flags, so `--base-url` can supply the url for a
+    // config table that sets only a budget. A url is the one field with no
+    // sensible default: a preset carries one, and a config-only backend has
+    // to get it from somewhere.
+    if out.url.is_empty() {
+        return Err(format!(
+            "backend `{name}` has no url: set `url` under \
+             [judge.backends.{name}], or pass --base-url"
+        ));
     }
     Ok(out)
 }
@@ -568,12 +604,21 @@ Append to `crates/systemone-client/src/client.rs` tests:
     async fn a_client_without_a_key_sends_no_authorization_header() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(wiremock::matchers::header_exists("authorization").not())
             .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
             .mount(&server)
             .await;
         let c = Client::new(server.uri(), None);
         assert!(c.ask(&req()).await.is_ok(), "a local server with no auth is normal");
+
+        // wiremock 0.6 has no negation matcher, so assert on what was
+        // actually sent. An absent header and an empty bearer are
+        // different things on the wire, and only one of them is correct.
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].headers.get("authorization").is_none(),
+            "no key means no header at all"
+        );
     }
 
     #[tokio::test]
@@ -589,7 +634,7 @@ Append to `crates/systemone-client/src/client.rs` tests:
     }
 ```
 
-`wiremock::matchers::header_exists(..).not()` needs `use wiremock::matchers::header_exists;` and wiremock's `MatchExt` trait in scope: add `use wiremock::matchers::{header, header_exists, method};` and `use wiremock::MatchExt;`.
+The existing `use wiremock::matchers::{header, method};` covers both tests. Do not reach for a negation matcher: wiremock 0.6.5 has `header_exists` but no `not()` and no `Negate` matcher, which is why the first test inspects `received_requests()` instead.
 
 - [ ] **Step 3: Run to verify both fail**
 
@@ -655,9 +700,12 @@ Append to `crates/stratify-judge-core/src/backend.rs`, with `use systemone_clien
 /// "never send one". A local laya-serve binds without auth until
 /// LAYA_API_KEY is set, and then requires the bearer header.
 pub fn client_for(b: &Backend) -> Option<Client> {
-    let key = std::env::var(&b.api_key_env)
-        .ok()
-        .filter(|k| !k.trim().is_empty());
+    // One definition of "usable key", shared with the client crate rather
+    // than reimplemented here. An inline `.filter(|k| !k.trim().is_empty())`
+    // would agree today and drift tomorrow, and it could only be tested by
+    // writing the process environment, which races reqwest's own
+    // proxy-variable reads on a threaded test runner.
+    let key = systemone_client::usable_key(std::env::var(&b.api_key_env).ok());
     match (b.api_key_required, key) {
         (true, None) => None,
         (_, key) => Some(Client::new(b.url.clone(), key)),
@@ -801,7 +849,133 @@ In `driver.rs`, both call sites pass `&self.backend` instead of `&self.cfg.model
 Run: `cargo test -p stratify-judge-core`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Make the backend the only source of "which model"**
+
+The cache key now reads `self.backend`, but two places still read
+`self.cfg.model`, so `Driver` has two independent sources for one fact. Before
+this task they were the same field and could not disagree. Now they can, and
+the split is invisible to the suite because every test pairs
+`JudgeConfig::default()` (`model: "jev-latest"`) with `Backend::jev()`
+(`model: Some("jev-latest")`), so the two values coincide by construction.
+
+In `driver.rs`, the outgoing request takes the backend's model:
+
+```rust
+                let req = SystemOneRequest {
+                    state: serde_json::Value::Object(state),
+                    // The backend owns which model to ask. Reading cfg here
+                    // while the cache key reads the backend would let a
+                    // request go to one model and its answer be filed under
+                    // another's key, in a cache meant to be committed. It is
+                    // also already Option, so a backend with no model omits
+                    // the field rather than sending a name the endpoint does
+                    // not know.
+                    model: self.backend.model.clone(),
+                    questions: qs,
+                };
+```
+
+And `apply_one`'s fallback label prefers the response, then the backend's
+model, then the backend's name, so a judgment from a model-less backend is
+labelled `laya` rather than an empty string:
+
+```rust
+        if judgment.model.is_empty() {
+            judgment.model = if model.is_empty() {
+                self.backend
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| self.backend.name.clone())
+            } else {
+                model.to_string()
+            };
+        }
+```
+
+Then delete `JudgeConfig`'s `model` field, its `d_model()` default function, and
+its entry in the `Default` impl, in `config.rs`. The knob it provided is
+superseded: `--model` sets it per run, and `[judge.backends.<name>] model` sets
+it per backend. Update `defaults_match_the_spec_when_no_config_exists` to drop
+its `c.model` assertion.
+
+- [ ] **Step 6: Write the test that would have caught this**
+
+Append to `driver.rs`'s tests:
+
+```rust
+    /// The request must name the model the cache key hashes. When these
+    /// disagree, an answer from one model is filed under another's key, and
+    /// the cache is meant to be committed, so the mismatch outlives the run.
+    #[tokio::test]
+    async fn the_request_carries_the_backends_model_not_the_configs() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "jev-1.13.0",
+                "answers": {},
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = Backend {
+            model: Some("jev-preview".into()),
+            ..Backend::jev()
+        };
+        let d = Driver::new(
+            Some(Client::new(server.uri(), Some("k".into()))),
+            Cache::new(dir.path().into(), false),
+            JudgeConfig::default(),
+            pinned,
+        );
+        d.run(&mut report(1), &ctx()).await;
+
+        let sent = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["model"], "jev-preview", "the backend's model, not the config's");
+    }
+
+    /// A backend with no model omits the field entirely. Laya's documented
+    /// request has no `model` key, and sending one names an endpoint it does
+    /// not know.
+    #[tokio::test]
+    async fn a_backend_without_a_model_omits_the_field() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "laya-1",
+                "answers": {},
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let d = Driver::new(
+            Some(Client::new(server.uri(), None)),
+            Cache::new(dir.path().into(), false),
+            JudgeConfig::default(),
+            Backend {
+                url: server.uri(),
+                ..Backend::laya()
+            },
+        );
+        d.run(&mut report(1), &ctx()).await;
+
+        let sent = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert!(body.get("model").is_none(), "no model key at all: {body}");
+    }
+```
+
+- [ ] **Step 7: Correct the README**
+
+`README.md`'s Cache section says the key hashes the configured model alias.
+That is no longer true. It hashes the backend name and the backend's model, so
+a Jev answer and a Laya answer never share a key. Say that instead.
+
+- [ ] **Step 8: Commit**
 
 ```bash
 git add -A
@@ -1155,6 +1329,44 @@ Handle `RunError` from `driver.run` the same way: print it, print the report, re
 Run: `cargo test && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all --check`
 Expected: PASS.
 
+- [ ] **Step 4b: Remove the vendor facts the client crate no longer owns**
+
+Replacing the CLI's `Client::from_env_at` / `from_env` with `client_for` orphans
+more than those two methods. In `crates/systemone-client/src/client.rs`:
+
+```rust
+pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
+pub const ENV_API_KEY: &str = "TYPESAFE_API_KEY";
+```
+
+Both are now duplicated by `Backend::jev()`, which carries the same url and the
+same env var name. Two sources for one fact, and the pattern a previous review
+already caught elsewhere in this codebase.
+
+They are also the last vendor-specific things in a crate this project renamed
+specifically to be protocol-named rather than vendor-named. A crate called
+`systemone-client` should not hardcode one vendor's endpoint as its default or
+one vendor's environment variable as *the* API key.
+
+So delete, in this order:
+
+1. `Client::from_env`, `Client::from_env_at`, and the private `from_key`, along
+   with their tests. `usable_key` stays: `client_for` calls it, and its tests
+   are what cover the empty-key rule.
+2. `DEFAULT_BASE_URL` and `ENV_API_KEY`.
+
+`Backend::jev()` keeps the literals, which is now their only home.
+
+Note that `pub const` items produce no unused warning, so clippy will not tell
+you these are dead. Confirm by grep that nothing references them:
+
+```bash
+grep -rn 'DEFAULT_BASE_URL\|ENV_API_KEY\|from_env\|from_key' crates/ || echo "clean"
+```
+
+The CLI's integration tests legitimately still name `TYPESAFE_API_KEY` as a
+string, since that is the env var `Backend::jev()` reads. Those stay.
+
 - [ ] **Step 5: Update the README**
 
 Add a Backends section documenting both presets, the three flags, and the local Laya recipe:
@@ -1277,6 +1489,18 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/stratify-dev/stratify-j
 ```
 
 Then `cargo install --git`, matching the engine README's ordering and wording.
+
+- [ ] **Step 5b: Correct one README claim about --model**
+
+The Backends section says Laya ignores the model id, and separately that
+`--model` overlays whichever backend was resolved. Both are true, but read
+together they suggest `--backend laya --model x` has no effect at all. It does:
+the CLI serializes `"model": "x"` into the request, and whether Laya's server
+then ignores it is a fact about Laya, not about this tool.
+
+Qualify the first claim so the two agree. Say that the `laya` preset sends no
+model unless `--model` or a config table supplies one, rather than that Laya
+ignores the field.
 
 - [ ] **Step 6: Commit**
 

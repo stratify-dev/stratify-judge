@@ -1,5 +1,5 @@
 [package]
-name = "stratify-jev-judge"
+name = "stratify-judge-core"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -10,7 +10,7 @@ serde_json.workspace = true
 globset = "0.4"
 ignore = "0.4"
 toml = "0.8"
-jev-client = { path = "../jev-client" }
+systemone-client = { path = "../systemone-client" }
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "sync", "macros"] }
 futures = "0.3"

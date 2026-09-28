@@ -801,18 +801,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jev-client"
-version = "0.1.0"
-dependencies = [
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "wiremock",
-]
-
-[[package]]
 name = "js-sys"
 version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1337,32 +1325,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
-name = "stratify-jev-cli"
+name = "stratify-judge-cli"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
- "jev-client",
  "predicates",
  "serde",
  "serde_json",
- "stratify-jev-judge",
+ "stratify-judge-core",
+ "systemone-client",
  "tempfile",
  "tokio",
  "wiremock",
 ]
 
 [[package]]
-name = "stratify-jev-judge"
+name = "stratify-judge-core"
 version = "0.1.0"
 dependencies = [
  "futures",
  "globset",
  "ignore",
- "jev-client",
  "serde",
  "serde_json",
  "sha2",
+ "systemone-client",
  "tempfile",
  "tokio",
  "toml",
@@ -1410,6 +1398,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "systemone-client"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]

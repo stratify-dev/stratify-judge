@@ -1,15 +1,15 @@
 mod output;
 
 use clap::{Parser, ValueEnum};
-use jev_client::Client;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use stratify_jev_judge::cache::Cache;
-use stratify_jev_judge::config::JevConfig;
-use stratify_jev_judge::context::RepoContext;
-use stratify_jev_judge::driver::Driver;
-use stratify_jev_judge::model::{Confidence, Report, Severity};
+use stratify_judge_core::backend::{client_for, resolve_backend};
+use stratify_judge_core::cache::Cache;
+use stratify_judge_core::config::JudgeConfig;
+use stratify_judge_core::context::RepoContext;
+use stratify_judge_core::driver::Driver;
+use stratify_judge_core::model::{Confidence, Report, Severity};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -44,9 +44,10 @@ enum FailOn {
     Error,
 }
 
-/// Judge a Stratify report with Jev. Reads the report on stdin.
+/// Judge a Stratify report with a System One model. Reads the report on
+/// stdin.
 #[derive(Parser)]
-#[command(name = "stratify-jev", version)]
+#[command(name = "stratify-judge", version)]
 struct Args {
     /// Repository root, used for source reads and the file walk.
     #[arg(long, default_value = ".")]
@@ -76,11 +77,22 @@ struct Args {
     #[arg(long)]
     no_cache: bool,
 
-    #[arg(long, default_value = ".stratify/jev-cache")]
+    #[arg(long, default_value = ".stratify/judge-cache")]
     cache_dir: PathBuf,
 
+    /// Which model endpoint to ask: a built-in preset (jev, laya) or a
+    /// name with a [judge.backends.<name>] table. Defaults to the
+    /// [judge] backend key in config, then jev, when not passed.
+    #[arg(long)]
+    backend: Option<String>,
+
+    /// Model id to send. Jev requires one; Laya ignores it.
+    #[arg(long)]
+    model: Option<String>,
+
     /// Override the API base URL, for pointing at a capture proxy or a
-    /// local mock when diagnosing a live run.
+    /// local mock when diagnosing a live run. The resolved backend's API
+    /// key still goes with it, so only point this at a host you control.
     #[arg(long)]
     base_url: Option<String>,
 
@@ -100,21 +112,21 @@ async fn main() -> ExitCode {
         None => std::io::stdin().read_to_string(&mut raw).map(|_| ()),
     };
     if let Err(e) = read {
-        eprintln!("stratify-jev: cannot read the report: {e}");
+        eprintln!("stratify-judge: cannot read the report: {e}");
         return ExitCode::from(2);
     }
 
     let mut report: Report = match serde_json::from_str(&raw) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("stratify-jev: the input is not a Stratify JSON report: {e}");
+            eprintln!("stratify-judge: the input is not a Stratify JSON report: {e}");
             return ExitCode::from(2);
         }
     };
 
     if report.schema_version > Report::KNOWN_SCHEMA_VERSION {
         eprintln!(
-            "stratify-jev: schema_version {} is newer than this build understands, \
+            "stratify-judge: schema_version {} is newer than this build understands, \
              passing the report through unchanged",
             report.schema_version
         );
@@ -132,7 +144,7 @@ async fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "stratify-jev: cannot read {}: {e}. Passing the report through \
+                "stratify-judge: cannot read {}: {e}. Passing the report through \
                  unchanged, nothing was judged",
                 args.root.display()
             );
@@ -140,38 +152,92 @@ async fn main() -> ExitCode {
             return exit_code(&args, &report);
         }
     };
-    let cfg = JevConfig::load(&args.root);
+    let cfg = JudgeConfig::load(&args.root);
     // Resolved against the current directory, not --root: the cache is this
     // tool's own bookkeeping, and joining it onto --root would write
     // untracked files into whatever repository is being analysed.
     let cache = Cache::new(args.cache_dir.clone(), !args.no_cache);
+
+    // Resolution order, narrowest wins: the flag, then the [judge] backend
+    // key in config, then jev. The flag has to stay Option<String> with no
+    // clap default, or "typed --backend jev" would be indistinguishable
+    // from "typed nothing" and could never lose to a config key.
+    let backend_name = args
+        .backend
+        .clone()
+        .or_else(|| cfg.backend.clone())
+        .unwrap_or_else(|| "jev".to_string());
+
+    // An unresolvable backend is a configuration error discovered before
+    // anything is read from any model, unlike every other failure below,
+    // which passes the report through and lets --fail-on decide. So this
+    // one exits loudly instead of passing through.
+    let backend = match resolve_backend(
+        &backend_name,
+        &cfg,
+        args.base_url.as_deref(),
+        args.model.as_deref(),
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("stratify-judge: {e}");
+            return ExitCode::from(2);
+        }
+    };
 
     if args.dry_run {
         // Counted through the same prepare-and-cache-split path a real run
         // takes, so a committed cache is reflected. A preview that ignores
         // the cache overstates cost in exactly the steady state the README
         // recommends.
-        let (planned, tokens) = Driver::new(None, cache, cfg).plan(&report, &ctx);
-        println!("{planned} request(s) planned, {tokens} tokens estimated, nothing sent.");
-        return ExitCode::SUCCESS;
+        match Driver::new(None, cache, cfg, backend.clone()).plan(&report, &ctx) {
+            Ok((planned, tokens)) => {
+                println!(
+                    "backend {} at {}: {planned} request(s) planned, \
+                     {tokens} tokens estimated, nothing sent.",
+                    backend.name, backend.url
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                // A preview gates nothing: it always exits 0, per the
+                // README's own contract, since dry-run sends nothing and
+                // has nothing to fail a build over.
+                eprintln!("stratify-judge: {e}");
+                print!("{}", render(&args, &report));
+                return ExitCode::SUCCESS;
+            }
+        }
     }
 
-    let client = match &args.base_url {
-        Some(base) => Client::from_env_at(base.clone()),
-        None => Client::from_env(),
-    };
+    let client = client_for(&backend);
     match client {
         None => {
             eprintln!(
-                "stratify-jev: TYPESAFE_API_KEY is not set, passing the report through unchanged"
+                "stratify-judge: {} is not set, passing the report through unchanged",
+                backend.api_key_env
             );
         }
         Some(client) => {
-            let driver = Driver::new(Some(client), cache, cfg);
-            let stats = driver.run(&mut report, &ctx).await;
+            let driver = Driver::new(Some(client), cache, cfg, backend.clone());
+            let stats = match driver.run(&mut report, &ctx).await {
+                Ok(stats) => stats,
+                Err(failure) => {
+                    // Same pass-through rule as every other failure here: a
+                    // context floor stops judging, not the report from
+                    // reaching the caller or --fail-on from gating on it.
+                    // Falling through instead of returning here, with the
+                    // stats the floor had already earned, is what keeps
+                    // --verbose, the --root mismatch warning and the
+                    // per-error detail block below running exactly as they
+                    // do on any other failure path.
+                    eprintln!("stratify-judge: {failure}");
+                    failure.stats
+                }
+            };
             if args.verbose {
                 eprintln!(
-                    "stratify-jev: {} judged, {} from cache, {} request(s), {} failed, {} input tokens",
+                    "stratify-judge: {} judged, {} from cache, {} request(s), {} failed, {} input tokens",
                     stats.judged,
                     stats.from_cache,
                     stats.requested,
@@ -186,7 +252,7 @@ async fn main() -> ExitCode {
             // with genuinely generated or moved files should still work.
             if stats.prepared > 0 && stats.missing_sources * 2 > stats.prepared {
                 eprintln!(
-                    "stratify-jev: {} of {} findings name files that do not exist under {}; \
+                    "stratify-judge: {} of {} findings name files that do not exist under {}; \
                      is --root correct?",
                     stats.missing_sources,
                     stats.prepared,
@@ -198,18 +264,19 @@ async fn main() -> ExitCode {
             // that makes a bad key indistinguishable from a timeout.
             if stats.failed > 0 {
                 eprintln!(
-                    "stratify-jev: {} request(s) failed, {} finding(s) unjudged and left \
+                    "stratify-judge: {} request(s) failed, {} finding(s) unjudged and left \
                      unchanged",
                     stats.failed, stats.unjudged
                 );
                 for e in &stats.errors {
                     if e == "invalid or missing API key" {
                         eprintln!(
-                            "stratify-jev: error: {e} (retrying will not help; check \
-                             TYPESAFE_API_KEY)"
+                            "stratify-judge: error: {e} (retrying will not help; check \
+                             {})",
+                            backend.api_key_env
                         );
                     } else {
-                        eprintln!("stratify-jev: error: {e}");
+                        eprintln!("stratify-judge: error: {e}");
                     }
                 }
             }

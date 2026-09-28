@@ -1,16 +1,19 @@
 [package]
-name = "stratify-jev-cli"
+name = "stratify-judge-cli"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Judgment layer for Stratify: asks a model about findings static analysis could not prove"
+homepage = "https://github.com/stratify-dev/stratify-judge"
 
 [[bin]]
-name = "stratify-jev"
+name = "stratify-judge"
 path = "src/main.rs"
 
 [dependencies]
-stratify-jev-judge = { path = "../stratify-jev-judge" }
-jev-client = { path = "../jev-client" }
+stratify-judge-core = { path = "../stratify-judge-core" }
+systemone-client = { path = "../systemone-client" }
 serde.workspace = true
 serde_json.workspace = true
 clap = { version = "4", features = ["derive"] }

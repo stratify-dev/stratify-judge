@@ -1,18 +1,72 @@
+use crate::backend::Backend;
 use crate::cache::{cache_key, Cache};
-use crate::config::JevConfig;
+use crate::config::JudgeConfig;
 use crate::context::RepoContext;
-use crate::judges::{registry, Judge};
+use crate::judges::{self, registry, Judge};
 use crate::model::Report;
 // Only the test module below constructs a `Finding` directly; production
 // code here never names the type.
 #[cfg(test)]
 use crate::model::Finding;
 use crate::verdict::{apply, Judgment, Verdict};
-use jev_client::{Answer, Client, Question, SystemOneRequest};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use systemone_client::{Answer, Client, Question, SystemOneRequest};
 
-pub const TOKEN_CEILING: usize = 24_000;
+/// A failure that stops judging before any request is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunError {
+    /// The backend cannot hold one finding's state plus its questions, so
+    /// no batching strategy helps and truncating would ask the model about
+    /// a function it cannot see.
+    ContextTooSmall {
+        backend: String,
+        state_tokens: usize,
+        ceiling: usize,
+        finding: String,
+        cost: usize,
+    },
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunError::ContextTooSmall {
+                backend,
+                state_tokens,
+                ceiling,
+                finding,
+                cost,
+            } => write!(
+                f,
+                "backend `{backend}` holds {state_tokens} tokens of state \
+                 ({ceiling} after headroom), but `{finding}` needs about \
+                 {cost}. Raise `state_tokens` under [judge.backends.{backend}] \
+                 if the endpoint can take more, or serve a larger checkpoint"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RunError {}
+
+/// A `RunError` plus whatever `run` had already accounted for when it
+/// tripped. The context floor is checked per judge, after that judge's
+/// cache hits are already applied to the report, so a bare `RunError`
+/// would discard the accounting for work that genuinely happened.
+#[derive(Debug)]
+pub struct RunFailure {
+    pub stats: RunStats,
+    pub error: RunError,
+}
+
+impl std::fmt::Display for RunFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for RunFailure {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunStats {
@@ -25,10 +79,10 @@ pub struct RunStats {
     /// Distinct error messages, first occurrence of each kept. A hundred
     /// identical 401s must print once, not a hundred times.
     pub errors: Vec<String>,
-    /// Findings lost to a failed request. `failed` counts batches; with
-    /// `batch_findings` above one, a single failed batch loses several
-    /// findings, and a message that only names `failed` reads as if it
-    /// means one finding per failure.
+    /// Findings lost to a failed request or to the context floor. `failed`
+    /// counts batches; with `batch_findings` above one, a single failed
+    /// batch loses several findings, and a message that only names
+    /// `failed` reads as if it means one finding per failure.
     pub unjudged: usize,
     /// Findings prepared for judging whose span names a file this run could
     /// not read. A high count against `prepared` is the signature of a
@@ -90,7 +144,8 @@ fn slot_prefix(i: usize) -> String {
 pub struct Driver {
     client: Option<Arc<Client>>,
     cache: Cache,
-    cfg: JevConfig,
+    cfg: JudgeConfig,
+    backend: Backend,
 }
 
 /// One finding's prepared work: its state, its cache key, and where it
@@ -103,12 +158,31 @@ struct Prepared {
 }
 
 impl Driver {
-    pub fn new(client: Option<Client>, cache: Cache, cfg: JevConfig) -> Driver {
+    pub fn new(client: Option<Client>, cache: Cache, cfg: JudgeConfig, backend: Backend) -> Driver {
         Driver {
             client: client.map(Arc::new),
             cache,
             cfg,
+            backend,
         }
+    }
+
+    /// The largest single finding must fit, or nothing can. Checked before
+    /// any request so a too-small backend costs nothing.
+    fn check_fits(&self, items: &[(String, usize)]) -> Result<(), RunError> {
+        let ceiling = self.backend.token_ceiling();
+        for (name, cost) in items {
+            if *cost > ceiling {
+                return Err(RunError::ContextTooSmall {
+                    backend: self.backend.name.clone(),
+                    state_tokens: self.backend.state_tokens,
+                    ceiling,
+                    finding: name.clone(),
+                    cost: *cost,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// How many requests a real run would send right now, and the total
@@ -118,47 +192,60 @@ impl Driver {
     /// cache is reflected: a finding already answered costs nothing and is
     /// not counted. Sends nothing and needs no client, so `--dry-run` works
     /// without a key.
-    pub fn plan(&self, report: &Report, ctx: &RepoContext) -> (usize, usize) {
+    pub fn plan(&self, report: &Report, ctx: &RepoContext) -> Result<(usize, usize), RunError> {
         let mut requests = 0;
         let mut tokens = 0;
         for judge in registry() {
             let questions = judge.questions();
-            let mut misses: Vec<usize> = Vec::new();
+            let mut misses: Vec<(String, usize)> = Vec::new();
             for f in report.findings.iter().filter(|f| f.rule == judge.rule()) {
                 let state = judge.state_for(f, ctx);
                 let key = cache_key(
                     judge.rule(),
                     judge.version(),
-                    &self.cfg.model,
+                    &self.backend,
                     &state,
                     &questions,
                 );
                 if self.cache.get(&key).is_none() {
-                    misses.push(estimate_tokens(&state, &questions));
+                    let name = judges::dead_code::function_name(&f.message)
+                        .unwrap_or(&f.message)
+                        .to_string();
+                    misses.push((name, estimate_tokens(&state, &questions)));
                 }
             }
             if misses.is_empty() {
                 continue;
             }
-            tokens += misses.iter().sum::<usize>();
+            self.check_fits(&misses)?;
+            tokens += misses.iter().map(|(_, cost)| cost).sum::<usize>();
+            let est: Vec<usize> = misses.iter().map(|(_, cost)| *cost).collect();
             requests += plan_batches(
                 misses.len(),
                 self.cfg.batch_findings,
-                &misses,
-                TOKEN_CEILING,
+                &est,
+                self.backend.token_ceiling(),
             )
             .len();
         }
-        (requests, tokens)
+        Ok((requests, tokens))
     }
 
     /// Judge every finding a registered judge claims. Findings the model
     /// never reaches, for any reason, are left exactly as the engine
     /// reported them.
-    pub async fn run(&self, report: &mut Report, ctx: &RepoContext) -> RunStats {
+    ///
+    /// The error is boxed: `RunFailure` carries a whole `RunStats`, which
+    /// clippy's `result_large_err` correctly flags next to a `RunStats`-only
+    /// success path.
+    pub async fn run(
+        &self,
+        report: &mut Report,
+        ctx: &RepoContext,
+    ) -> Result<RunStats, Box<RunFailure>> {
         let mut stats = RunStats::default();
         let Some(client) = self.client.clone() else {
-            return stats;
+            return Ok(stats);
         };
 
         for judge in registry() {
@@ -179,7 +266,7 @@ impl Driver {
                 let key = cache_key(
                     judge.rule(),
                     judge.version(),
-                    &self.cfg.model,
+                    &self.backend,
                     &state,
                     &questions,
                 );
@@ -217,9 +304,34 @@ impl Driver {
                 continue;
             }
 
+            let items: Vec<(String, usize)> = misses
+                .iter()
+                .map(|p| {
+                    let msg = &report.findings[p.index].message;
+                    let name = judges::dead_code::function_name(msg)
+                        .unwrap_or(msg)
+                        .to_string();
+                    (name, p.tokens)
+                })
+                .collect();
+            if let Err(error) = self.check_fits(&items) {
+                // The stats accumulated so far already reflect real work:
+                // this judge's cache hits were applied above, before the
+                // misses were ever built. Losing them here would make
+                // --verbose, under a warm cache plus a too-small backend,
+                // report nothing at all.
+                stats.unjudged += misses.len();
+                return Err(Box::new(RunFailure { stats, error }));
+            }
+
             // Batch the misses and fire them concurrently.
             let est: Vec<usize> = misses.iter().map(|p| p.tokens).collect();
-            let batches = plan_batches(misses.len(), self.cfg.batch_findings, &est, TOKEN_CEILING);
+            let batches = plan_batches(
+                misses.len(),
+                self.cfg.batch_findings,
+                &est,
+                self.backend.token_ceiling(),
+            );
 
             let sem = Arc::new(tokio::sync::Semaphore::new(self.cfg.concurrency.max(1)));
             let mut tasks = Vec::new();
@@ -244,7 +356,14 @@ impl Driver {
                 }
                 let req = SystemOneRequest {
                     state: serde_json::Value::Object(state),
-                    model: self.cfg.model.clone(),
+                    // The backend owns which model to ask. Reading cfg here
+                    // while the cache key reads the backend would let a
+                    // request go to one model and its answer be filed under
+                    // another's key, in a cache meant to be committed. It is
+                    // also already Option, so a backend with no model omits
+                    // the field rather than sending a name the endpoint does
+                    // not know.
+                    model: self.backend.model.clone(),
                     questions: qs,
                 };
                 let client = client.clone();
@@ -317,7 +436,7 @@ impl Driver {
             }
         }
 
-        stats
+        Ok(stats)
     }
 
     fn apply_one(
@@ -337,7 +456,10 @@ impl Driver {
         let mut judgment: Judgment = judge.judge(finding, answers, &self.cfg.thresholds);
         if judgment.model.is_empty() {
             judgment.model = if model.is_empty() {
-                self.cfg.model.clone()
+                self.backend
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| self.backend.name.clone())
             } else {
                 model.to_string()
             };
@@ -363,9 +485,9 @@ impl Driver {
 mod tests {
     use super::*;
     use crate::model::{Confidence, Severity, Span};
-    use jev_client::RetryPolicy;
     use serde_json::json;
     use std::path::PathBuf;
+    use systemone_client::RetryPolicy;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -418,7 +540,7 @@ mod tests {
     fn a_zero_batch_size_still_makes_progress() {
         // `.max(1)` is load-bearing: without it `cur.len() >= 0` is true on
         // the first iteration, so an empty batch is pushed and becomes a
-        // request with an empty state and no questions. JevConfig applies no
+        // request with an empty state and no questions. JudgeConfig applies no
         // validation, so batch_findings = 0 in a user's stratify.toml
         // reaches this directly.
         assert_eq!(
@@ -438,18 +560,23 @@ mod tests {
     #[test]
     fn plan_counts_batches_and_discounts_the_cache() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig {
+        let cfg = JudgeConfig {
             batch_findings: 2,
-            ..JevConfig::default()
+            ..JudgeConfig::default()
         };
-        let d = Driver::new(None, Cache::new(dir.path().into(), true), cfg);
+        let d = Driver::new(
+            None,
+            Cache::new(dir.path().into(), true),
+            cfg,
+            Backend::jev(),
+        );
         // Five dead_code findings at two per batch is three requests, and
         // the token estimate is the sum of all five slots' costs.
-        let (requests, tokens) = d.plan(&report(5), &ctx());
+        let (requests, tokens) = d.plan(&report(5), &ctx()).unwrap();
         assert_eq!(requests, 3);
         assert!(tokens > 0, "a real request costs real tokens");
         // A report with nothing this judge claims costs nothing.
-        assert_eq!(d.plan(&report(0), &ctx()), (0, 0));
+        assert_eq!(d.plan(&report(0), &ctx()).unwrap(), (0, 0));
     }
 
     #[tokio::test]
@@ -479,8 +606,9 @@ mod tests {
 
         // Before anything is cached the plan is one request, at a nonzero
         // token cost.
-        let (requests, tokens) =
-            Driver::new(None, cache(), JevConfig::default()).plan(&report(1), &ctx());
+        let (requests, tokens) = Driver::new(None, cache(), JudgeConfig::default(), Backend::jev())
+            .plan(&report(1), &ctx())
+            .unwrap();
         assert_eq!(requests, 1);
         assert!(tokens > 0);
 
@@ -488,14 +616,17 @@ mod tests {
         // tokens. This is the steady state the README recommends, and a
         // plan that ignored the cache would still say one.
         let d = Driver::new(
-            Some(Client::new(server.uri(), "k".into())),
+            Some(Client::new(server.uri(), Some("k".into()))),
             cache(),
-            JevConfig::default(),
+            JudgeConfig::default(),
+            Backend::jev(),
         );
-        d.run(&mut report(1), &ctx()).await;
+        d.run(&mut report(1), &ctx()).await.unwrap();
 
         assert_eq!(
-            Driver::new(None, cache(), JevConfig::default()).plan(&report(1), &ctx()),
+            Driver::new(None, cache(), JudgeConfig::default(), Backend::jev())
+                .plan(&report(1), &ctx())
+                .unwrap(),
             (0, 0)
         );
     }
@@ -506,11 +637,12 @@ mod tests {
         let d = Driver::new(
             None,
             Cache::new(dir.path().into(), true),
-            JevConfig::default(),
+            JudgeConfig::default(),
+            Backend::jev(),
         );
         let mut r = report(3);
         let before = r.clone();
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
         assert_eq!(r, before);
         assert_eq!(stats.judged, 0);
         assert_eq!(stats.requested, 0);
@@ -538,15 +670,16 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let client = Client::new(server.uri(), "k".into());
+        let client = Client::new(server.uri(), Some("k".into()));
         let d = Driver::new(
             Some(client),
             Cache::new(dir.path().into(), true),
-            JevConfig::default(),
+            JudgeConfig::default(),
+            Backend::jev(),
         );
 
         let mut r = report(1);
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
 
         assert_eq!(stats.judged, 1);
         assert_eq!(stats.requested, 1);
@@ -573,12 +706,13 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let d = Driver::new(
-            Some(Client::new(server.uri(), "k".into())),
+            Some(Client::new(server.uri(), Some("k".into()))),
             Cache::new(dir.path().into(), false),
-            JevConfig::default(),
+            JudgeConfig::default(),
+            Backend::jev(),
         );
         let mut r = report(2);
-        d.run(&mut r, &ctx()).await;
+        d.run(&mut r, &ctx()).await.unwrap();
 
         let sent = server.received_requests().await.unwrap();
         assert_eq!(sent.len(), 1, "two findings fit one batch");
@@ -637,20 +771,21 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig::default();
+        let cfg = JudgeConfig::default();
         let make = || {
             Driver::new(
-                Some(Client::new(server.uri(), "k".into())),
+                Some(Client::new(server.uri(), Some("k".into()))),
                 Cache::new(dir.path().into(), true),
                 cfg.clone(),
+                Backend::jev(),
             )
         };
 
         let mut first = report(1);
-        make().run(&mut first, &ctx()).await;
+        make().run(&mut first, &ctx()).await.unwrap();
 
         let mut second = report(1);
-        let stats = make().run(&mut second, &ctx()).await;
+        let stats = make().run(&mut second, &ctx()).await.unwrap();
 
         assert_eq!(stats.requested, 0);
         assert_eq!(stats.from_cache, 1);
@@ -694,14 +829,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let make = || {
             Driver::new(
-                Some(Client::new(server.uri(), "k".into())),
+                Some(Client::new(server.uri(), Some("k".into()))),
                 Cache::new(dir.path().into(), true),
-                JevConfig::default(),
+                JudgeConfig::default(),
+                Backend::jev(),
             )
         };
 
         let mut first = report(1);
-        let s1 = make().run(&mut first, &ctx()).await;
+        let s1 = make().run(&mut first, &ctx()).await.unwrap();
         assert_eq!(s1.requested, 1);
         assert_eq!(s1.judged, 1, "a partial set is still applied");
         // resolver_missed_a_call is the only missing key; decide's
@@ -712,7 +848,7 @@ mod tests {
         assert_eq!(first.findings[0].extra["judgment"]["verdict"], "dismiss");
 
         let mut second = report(1);
-        let stats = make().run(&mut second, &ctx()).await;
+        let stats = make().run(&mut second, &ctx()).await.unwrap();
         assert_eq!(stats.from_cache, 0, "a partial set must not be cached");
         assert_eq!(stats.requested, 1, "so the second run asks again");
     }
@@ -749,24 +885,25 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig {
+        let cfg = JudgeConfig {
             batch_findings: 1,
-            ..JevConfig::default()
+            ..JudgeConfig::default()
         };
         let d = Driver::new(
             Some(
-                Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                Client::new(server.uri(), Some("k".into())).with_retry(RetryPolicy {
                     max_attempts: 1,
                     base_delay: std::time::Duration::from_millis(1),
                 }),
             ),
             Cache::new(dir.path().into(), false),
             cfg,
+            Backend::jev(),
         );
 
         let mut r = report(2);
         let before = r.clone();
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
 
         assert_eq!(stats.failed, 1, "exactly one batch failed");
         assert_eq!(stats.judged, 1, "the other still applied");
@@ -801,23 +938,24 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig {
+        let cfg = JudgeConfig {
             batch_findings: 10,
-            ..JevConfig::default()
+            ..JudgeConfig::default()
         };
         let d = Driver::new(
             Some(
-                Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                Client::new(server.uri(), Some("k".into())).with_retry(RetryPolicy {
                     max_attempts: 1,
                     base_delay: std::time::Duration::from_millis(1),
                 }),
             ),
             Cache::new(dir.path().into(), false),
             cfg,
+            Backend::jev(),
         );
 
         let mut r = report(3);
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
 
         assert_eq!(stats.failed, 1, "one batch failed");
         assert_eq!(
@@ -838,23 +976,24 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig {
+        let cfg = JudgeConfig {
             batch_findings: 1,
-            ..JevConfig::default()
+            ..JudgeConfig::default()
         };
         let d = Driver::new(
             Some(
-                Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                Client::new(server.uri(), Some("k".into())).with_retry(RetryPolicy {
                     max_attempts: 1,
                     base_delay: std::time::Duration::from_millis(1),
                 }),
             ),
             Cache::new(dir.path().into(), false),
             cfg,
+            Backend::jev(),
         );
 
         let mut r = report(4);
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
 
         assert_eq!(stats.failed, 4, "four batches, all failing");
         assert_eq!(stats.unjudged, 4);
@@ -888,11 +1027,12 @@ mod tests {
         r.findings[0].span.file = "no/such/file.rs".into();
 
         let d = Driver::new(
-            Some(Client::new(server.uri(), "k".into())),
+            Some(Client::new(server.uri(), Some("k".into()))),
             Cache::new(dir.path().into(), false),
-            JevConfig::default(),
+            JudgeConfig::default(),
+            Backend::jev(),
         );
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
         assert_eq!(stats.missing_sources, 1);
         assert_eq!(stats.prepared, 1);
     }
@@ -906,27 +1046,231 @@ mod tests {
             .await;
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = JevConfig {
+        let cfg = JudgeConfig {
             concurrency: 2,
-            ..JevConfig::default()
+            ..JudgeConfig::default()
         };
         let d = Driver::new(
             Some(
-                Client::new(server.uri(), "k".into()).with_retry(RetryPolicy {
+                Client::new(server.uri(), Some("k".into())).with_retry(RetryPolicy {
                     max_attempts: 2,
                     base_delay: std::time::Duration::from_millis(1),
                 }),
             ),
             Cache::new(dir.path().into(), true),
             cfg,
+            Backend::jev(),
         );
 
         let mut r = report(2);
         let before = r.clone();
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
 
         assert_eq!(stats.failed, 1);
         assert_eq!(stats.judged, 0);
         assert_eq!(r, before);
+    }
+
+    /// The request must name the model the cache key hashes. When these
+    /// disagree, an answer from one model is filed under another's key, and
+    /// the cache is meant to be committed, so the mismatch outlives the run.
+    #[tokio::test]
+    async fn the_request_carries_the_backends_model_not_the_configs() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "jev-1.13.0",
+                "answers": {},
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = Backend {
+            model: Some("jev-preview".into()),
+            ..Backend::jev()
+        };
+        let d = Driver::new(
+            Some(Client::new(server.uri(), Some("k".into()))),
+            Cache::new(dir.path().into(), false),
+            JudgeConfig::default(),
+            pinned,
+        );
+        d.run(&mut report(1), &ctx()).await.unwrap();
+
+        let sent = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(
+            body["model"], "jev-preview",
+            "the backend's model, not the config's"
+        );
+    }
+
+    /// A backend with no model omits the field entirely. Laya's documented
+    /// request has no `model` key, and sending one names an endpoint it does
+    /// not know.
+    #[tokio::test]
+    async fn a_backend_without_a_model_omits_the_field() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "laya-1",
+                "answers": {},
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let d = Driver::new(
+            Some(Client::new(server.uri(), None)),
+            Cache::new(dir.path().into(), false),
+            JudgeConfig::default(),
+            Backend {
+                url: server.uri(),
+                ..Backend::laya()
+            },
+        );
+        d.run(&mut report(1), &ctx()).await.unwrap();
+
+        let sent = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert!(body.get("model").is_none(), "no model key at all: {body}");
+    }
+
+    /// I4: the context floor is checked only against the misses, after this
+    /// judge's cache hits are already applied to the report. A `RunFailure`
+    /// must still carry that accounting rather than discard it, or
+    /// `--verbose` under a warm cache plus a too-small backend reports
+    /// nothing at all.
+    #[tokio::test]
+    async fn a_floor_error_after_a_cache_hit_still_carries_its_stats() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "jev-1.13.0",
+                "answers": {
+                    "s0__framework_invoked": { "noul": 0.95 },
+                    "s0__test_only": { "noul": 0.01 },
+                    "s0__external_api": { "noul": 0.02 },
+                    "s0__resolver_missed_a_call": { "noul": 0.03 },
+                    "s0__explanation": {
+                        "choice": "framework_invoked",
+                        "probabilities": {},
+                        "confidence": 0.9
+                    }
+                },
+                "usage": { "input_tokens": 300, "output_tokens": 0 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Backend {
+            url: server.uri(),
+            ..Backend::jev()
+        };
+
+        // Warm the cache for one finding at the full-size budget, so the
+        // request actually succeeds and the answer lands on disk.
+        let warm = Driver::new(
+            Some(Client::new(server.uri(), Some("k".into()))),
+            Cache::new(dir.path().into(), true),
+            JudgeConfig::default(),
+            backend.clone(),
+        );
+        warm.run(&mut report(1), &ctx()).await.unwrap();
+
+        // Same name, url and model, so the cache key matches and the warm
+        // entry still hits; only state_tokens shrinks, which is not part
+        // of the key. The second finding is new, so it is a miss the tiny
+        // ceiling cannot hold.
+        let tiny = Backend {
+            state_tokens: 1,
+            ..backend
+        };
+        let cold = Driver::new(
+            Some(Client::new(server.uri(), Some("k".into()))),
+            Cache::new(dir.path().into(), true),
+            JudgeConfig::default(),
+            tiny,
+        );
+        let mut r = report(2);
+        let failure = cold.run(&mut r, &ctx()).await.unwrap_err();
+        assert!(
+            failure.stats.from_cache >= 1,
+            "the cache hit must survive the failure: {:?}",
+            failure.stats
+        );
+        assert!(
+            failure.stats.unjudged > 0,
+            "the floor-dropped finding must be counted: {:?}",
+            failure.stats
+        );
+    }
+
+    /// Review Focus 3: a budget too small for one finding must say so by
+    /// name rather than truncate the state or send a request that 422s.
+    #[tokio::test]
+    async fn a_backend_too_small_for_one_finding_is_a_named_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // 512 is Laya's English checkpoint. One dead_code finding needs
+        // roughly 1,200 tokens, so this cannot work and must not pretend to.
+        let small = Backend {
+            state_tokens: 512,
+            ..Backend::laya()
+        };
+        let d = Driver::new(
+            None,
+            Cache::new(dir.path().into(), false),
+            JudgeConfig::default(),
+            small,
+        );
+        let err = d.plan(&report(1), &ctx()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("laya"), "names the backend: {msg}");
+        assert!(msg.contains("512"), "names the budget: {msg}");
+        assert!(
+            msg.contains("fn0"),
+            "names the finding it could not fit: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_budget_is_the_same_named_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let zero = Backend {
+            state_tokens: 0,
+            ..Backend::laya()
+        };
+        let d = Driver::new(
+            None,
+            Cache::new(dir.path().into(), false),
+            JudgeConfig::default(),
+            zero,
+        );
+        assert!(d.plan(&report(1), &ctx()).is_err());
+    }
+
+    #[test]
+    fn the_ceiling_follows_the_backend_not_a_constant() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |b: Backend| {
+            Driver::new(
+                None,
+                Cache::new(dir.path().into(), false),
+                JudgeConfig::default(),
+                b,
+            )
+        };
+        // Laya's 6,144 fits fewer findings per batch than Jev's 24,576.
+        let (laya_reqs, _) = mk(Backend::laya()).plan(&report(20), &ctx()).unwrap();
+        let (jev_reqs, _) = mk(Backend::jev()).plan(&report(20), &ctx()).unwrap();
+        assert!(
+            laya_reqs >= jev_reqs,
+            "a smaller budget cannot need fewer requests: laya {laya_reqs}, jev {jev_reqs}"
+        );
     }
 }

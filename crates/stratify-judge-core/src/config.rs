@@ -1,9 +1,6 @@
 use serde::Deserialize;
 use std::path::Path;
 
-fn d_model() -> String {
-    "jev-latest".to_string()
-}
 fn d_concurrency() -> usize {
     8
 }
@@ -67,9 +64,7 @@ pub struct Thresholds {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct JevConfig {
-    #[serde(default = "d_model")]
-    pub model: String,
+pub struct JudgeConfig {
     #[serde(default = "d_concurrency")]
     pub concurrency: usize,
     #[serde(default = "d_batch_findings")]
@@ -78,16 +73,25 @@ pub struct JevConfig {
     pub batch_files: usize,
     #[serde(default)]
     pub thresholds: Thresholds,
+    /// `[judge.backends.<name>]` tables, overlaying the built-in presets.
+    #[serde(default)]
+    pub backends: std::collections::BTreeMap<String, crate::backend::BackendOverride>,
+    /// `[judge] backend = "<name>"`, selecting which backend a run
+    /// resolves against when `--backend` is not passed on the CLI.
+    /// Resolution order is flag, then this key, then the `jev` default.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
-impl Default for JevConfig {
+impl Default for JudgeConfig {
     fn default() -> Self {
-        JevConfig {
-            model: d_model(),
+        JudgeConfig {
             concurrency: d_concurrency(),
             batch_findings: d_batch_findings(),
             batch_files: d_batch_files(),
             thresholds: Thresholds::default(),
+            backends: std::collections::BTreeMap::new(),
+            backend: None,
         }
     }
 }
@@ -95,15 +99,15 @@ impl Default for JevConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct Wrapper {
     #[serde(default)]
-    jev: Option<JevConfig>,
+    judge: Option<JudgeConfig>,
 }
 
-impl JevConfig {
-    /// `[jev]` from `stratify.toml`, overridden wholesale by
-    /// `stratify-jev.toml` when that file exists. Unparseable or absent
+impl JudgeConfig {
+    /// `[judge]` from `stratify.toml`, overridden wholesale by
+    /// `stratify-judge.toml` when that file exists. Unparseable or absent
     /// falls back to defaults, matching how the engine reads its own tables.
-    pub fn load(root: &Path) -> JevConfig {
-        for name in ["stratify-jev.toml", "stratify.toml"] {
+    pub fn load(root: &Path) -> JudgeConfig {
+        for name in ["stratify-judge.toml", "stratify.toml"] {
             let Ok(text) = std::fs::read_to_string(root.join(name)) else {
                 continue;
             };
@@ -111,11 +115,11 @@ impl JevConfig {
                 Ok(w) => w,
                 Err(_) => continue,
             };
-            if let Some(cfg) = w.jev {
+            if let Some(cfg) = w.judge {
                 return cfg;
             }
         }
-        JevConfig::default()
+        JudgeConfig::default()
     }
 }
 
@@ -126,8 +130,7 @@ mod tests {
     #[test]
     fn defaults_match_the_spec_when_no_config_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let c = JevConfig::load(dir.path());
-        assert_eq!(c.model, "jev-latest");
+        let c = JudgeConfig::load(dir.path());
         assert_eq!(c.concurrency, 8);
         assert_eq!(c.batch_findings, 10);
         assert_eq!(c.thresholds.dead_code.dismiss_at, 0.75);
@@ -138,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_jev_table_out_of_stratify_toml() {
+    fn reads_the_judge_table_out_of_stratify_toml() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("stratify.toml"),
@@ -146,38 +149,64 @@ mod tests {
 [ignore]
 paths = ["vendor/**"]
 
-[jev]
+[judge]
 concurrency = 3
 
-[jev.thresholds.dead_code]
+[judge.thresholds.dead_code]
 dismiss_at = 0.9
 "#,
         )
         .unwrap();
-        let c = JevConfig::load(dir.path());
+        let c = JudgeConfig::load(dir.path());
         assert_eq!(c.concurrency, 3);
         assert_eq!(c.thresholds.dead_code.dismiss_at, 0.9);
         // Unset keys keep their defaults.
         assert_eq!(c.thresholds.dead_code.api_at, 0.75);
-        assert_eq!(c.model, "jev-latest");
     }
 
     #[test]
-    fn stratify_jev_toml_overrides_stratify_toml() {
+    fn stratify_judge_toml_overrides_stratify_toml() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("stratify.toml"), "[jev]\nconcurrency = 3\n").unwrap();
         std::fs::write(
-            dir.path().join("stratify-jev.toml"),
-            "[jev]\nconcurrency = 16\n",
+            dir.path().join("stratify.toml"),
+            "[judge]\nconcurrency = 3\n",
         )
         .unwrap();
-        assert_eq!(JevConfig::load(dir.path()).concurrency, 16);
+        std::fs::write(
+            dir.path().join("stratify-judge.toml"),
+            "[judge]\nconcurrency = 16\n",
+        )
+        .unwrap();
+        assert_eq!(JudgeConfig::load(dir.path()).concurrency, 16);
     }
 
     #[test]
     fn an_unparseable_config_falls_back_to_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("stratify.toml"), "[jev\nbroken").unwrap();
-        assert_eq!(JevConfig::load(dir.path()).concurrency, 8);
+        std::fs::write(dir.path().join("stratify.toml"), "[judge\nbroken").unwrap();
+        assert_eq!(JudgeConfig::load(dir.path()).concurrency, 8);
+    }
+
+    /// I3: `[judge] backend = "laya"` was silently dropped because
+    /// `JudgeConfig` had no field for it, so a run went to the hosted
+    /// default with no warning.
+    #[test]
+    fn the_backend_key_selects_a_backend_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("stratify.toml"),
+            "[judge]\nbackend = \"laya\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            JudgeConfig::load(dir.path()).backend.as_deref(),
+            Some("laya")
+        );
+    }
+
+    #[test]
+    fn the_backend_key_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(JudgeConfig::load(dir.path()).backend, None);
     }
 }

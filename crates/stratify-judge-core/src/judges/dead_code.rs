@@ -3,8 +3,8 @@ use crate::context::{language_of, RepoContext};
 use crate::judges::Judge;
 use crate::model::{Confidence, Finding, Severity};
 use crate::verdict::{Judgment, Verdict};
-use jev_client::{Answer, NoulCriteria, Question};
 use std::collections::BTreeMap;
+use systemone_client::{Answer, NoulCriteria, Question};
 
 pub struct DeadCodeJudge;
 
@@ -500,9 +500,9 @@ mod tests {
     use crate::config::DeadCodeThresholds;
     use crate::context::RepoContext;
     use crate::model::{Confidence, Finding, Severity, Span};
-    use jev_client::Answer;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use systemone_client::Answer;
 
     fn ctx() -> RepoContext {
         let root =
