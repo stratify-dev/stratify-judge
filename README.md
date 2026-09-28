@@ -19,6 +19,9 @@ info  src/lib.rs:6  possibly unused function `helper`
 
 ## Install
 
+Brew and the one-line installer resolve from the first tagged release
+(`v0.1.0`) onward; before that, build from source.
+
 **Homebrew** (macOS and Linux):
 
 ```sh
