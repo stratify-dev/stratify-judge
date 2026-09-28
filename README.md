@@ -67,7 +67,8 @@ real run uses, so a committed cache shows as zero requests. It always exits
 
 `--base-url` points the client at a different API base URL, such as a
 capture proxy or a local mock, for diagnosing what a live run is actually
-sending and receiving.
+sending and receiving. The resolved backend's API key still goes with the
+request, so only point this at a host you control.
 
 ## Backends
 

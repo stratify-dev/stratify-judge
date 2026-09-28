@@ -91,7 +91,8 @@ struct Args {
     model: Option<String>,
 
     /// Override the API base URL, for pointing at a capture proxy or a
-    /// local mock when diagnosing a live run.
+    /// local mock when diagnosing a live run. The resolved backend's API
+    /// key still goes with it, so only point this at a host you control.
     #[arg(long)]
     base_url: Option<String>,
 
