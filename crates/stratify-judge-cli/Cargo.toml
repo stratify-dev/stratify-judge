@@ -3,6 +3,9 @@ name = "stratify-judge-cli"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Judgment layer for Stratify: asks a model about findings static analysis could not prove"
+homepage = "https://github.com/stratify-dev/stratify-judge"
 
 [[bin]]
 name = "stratify-judge"

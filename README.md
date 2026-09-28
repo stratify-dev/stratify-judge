@@ -17,6 +17,28 @@ info  src/lib.rs:6  possibly unused function `helper`
 73 findings, 9 shown, 64 hidden. Re-run with --show-dismissed to see them.
 ```
 
+## Install
+
+**Homebrew** (macOS and Linux):
+
+```sh
+brew install stratify-dev/tap/stratify-judge
+```
+
+**One-line installer** (macOS, Linux):
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/stratify-dev/stratify-judge/releases/latest/download/stratify-judge-cli-installer.sh | sh
+```
+
+**From source** (needs a [Rust toolchain](https://rustup.rs)):
+
+```sh
+cargo install --git https://github.com/stratify-dev/stratify-judge stratify-judge-cli --locked
+```
+
+The binary is `stratify-judge`. Run `stratify-judge --help` to see every command.
+
 ## What it does
 
 Stratify is precise about what it can prove. When cross-file resolution is
@@ -57,7 +79,8 @@ built in:
   `jev-latest`.
 - `laya`: Convai's Laya, served locally under Apache 2.0 at
   `http://127.0.0.1:8000`. Needs no key unless `LAYA_API_KEY` is set, in
-  which case it requires one, and it ignores the model id.
+  which case it requires one. The preset sends no model id unless `--model`
+  or a config table supplies one.
 
 `--model <id>` overrides the model sent in the request. `--base-url`
 overrides the endpoint. Both flags overlay whichever backend `--backend`
