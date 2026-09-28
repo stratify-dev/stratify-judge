@@ -152,9 +152,19 @@ async fn main() -> ExitCode {
         // takes, so a committed cache is reflected. A preview that ignores
         // the cache overstates cost in exactly the steady state the README
         // recommends.
-        let (planned, tokens) = Driver::new(None, cache, cfg, Backend::jev()).plan(&report, &ctx);
-        println!("{planned} request(s) planned, {tokens} tokens estimated, nothing sent.");
-        return ExitCode::SUCCESS;
+        match Driver::new(None, cache, cfg, Backend::jev()).plan(&report, &ctx) {
+            Ok((planned, tokens)) => {
+                println!("{planned} request(s) planned, {tokens} tokens estimated, nothing sent.");
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                // Same pass-through rule as every other failure: a context
+                // floor stops judging, not the report from going out.
+                eprintln!("stratify-judge: {e}");
+                print!("{}", render(&args, &report));
+                return exit_code(&args, &report);
+            }
+        }
     }
 
     let client = match &args.base_url {
@@ -169,7 +179,17 @@ async fn main() -> ExitCode {
         }
         Some(client) => {
             let driver = Driver::new(Some(client), cache, cfg, Backend::jev());
-            let stats = driver.run(&mut report, &ctx).await;
+            let stats = match driver.run(&mut report, &ctx).await {
+                Ok(stats) => stats,
+                Err(e) => {
+                    // Same pass-through rule as every other failure here: a
+                    // context floor stops judging, not the report from
+                    // reaching the caller or --fail-on from gating on it.
+                    eprintln!("stratify-judge: {e}");
+                    print!("{}", render(&args, &report));
+                    return exit_code(&args, &report);
+                }
+            };
             if args.verbose {
                 eprintln!(
                     "stratify-judge: {} judged, {} from cache, {} request(s), {} failed, {} input tokens",

@@ -2,7 +2,7 @@ use crate::backend::Backend;
 use crate::cache::{cache_key, Cache};
 use crate::config::JudgeConfig;
 use crate::context::RepoContext;
-use crate::judges::{registry, Judge};
+use crate::judges::{self, registry, Judge};
 use crate::model::Report;
 // Only the test module below constructs a `Finding` directly; production
 // code here never names the type.
@@ -13,7 +13,42 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use systemone_client::{Answer, Client, Question, SystemOneRequest};
 
-pub const TOKEN_CEILING: usize = 24_000;
+/// A failure that stops judging before any request is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunError {
+    /// The backend cannot hold one finding's state plus its questions, so
+    /// no batching strategy helps and truncating would ask the model about
+    /// a function it cannot see.
+    ContextTooSmall {
+        backend: String,
+        state_tokens: usize,
+        ceiling: usize,
+        finding: String,
+        cost: usize,
+    },
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunError::ContextTooSmall {
+                backend,
+                state_tokens,
+                ceiling,
+                finding,
+                cost,
+            } => write!(
+                f,
+                "backend `{backend}` holds {state_tokens} tokens of state \
+                 ({ceiling} after headroom), but `{finding}` needs about \
+                 {cost}. Raise `state_tokens` under [judge.backends.{backend}] \
+                 if the endpoint can take more, or serve a larger checkpoint"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RunError {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunStats {
@@ -114,6 +149,24 @@ impl Driver {
         }
     }
 
+    /// The largest single finding must fit, or nothing can. Checked before
+    /// any request so a too-small backend costs nothing.
+    fn check_fits(&self, items: &[(String, usize)]) -> Result<(), RunError> {
+        let ceiling = self.backend.token_ceiling();
+        for (name, cost) in items {
+            if *cost > ceiling {
+                return Err(RunError::ContextTooSmall {
+                    backend: self.backend.name.clone(),
+                    state_tokens: self.backend.state_tokens,
+                    ceiling,
+                    finding: name.clone(),
+                    cost: *cost,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// How many requests a real run would send right now, and the total
     /// input tokens they would cost.
     ///
@@ -121,12 +174,12 @@ impl Driver {
     /// cache is reflected: a finding already answered costs nothing and is
     /// not counted. Sends nothing and needs no client, so `--dry-run` works
     /// without a key.
-    pub fn plan(&self, report: &Report, ctx: &RepoContext) -> (usize, usize) {
+    pub fn plan(&self, report: &Report, ctx: &RepoContext) -> Result<(usize, usize), RunError> {
         let mut requests = 0;
         let mut tokens = 0;
         for judge in registry() {
             let questions = judge.questions();
-            let mut misses: Vec<usize> = Vec::new();
+            let mut misses: Vec<(String, usize)> = Vec::new();
             for f in report.findings.iter().filter(|f| f.rule == judge.rule()) {
                 let state = judge.state_for(f, ctx);
                 let key = cache_key(
@@ -137,31 +190,36 @@ impl Driver {
                     &questions,
                 );
                 if self.cache.get(&key).is_none() {
-                    misses.push(estimate_tokens(&state, &questions));
+                    let name = judges::dead_code::function_name(&f.message)
+                        .unwrap_or(&f.message)
+                        .to_string();
+                    misses.push((name, estimate_tokens(&state, &questions)));
                 }
             }
             if misses.is_empty() {
                 continue;
             }
-            tokens += misses.iter().sum::<usize>();
+            self.check_fits(&misses)?;
+            tokens += misses.iter().map(|(_, cost)| cost).sum::<usize>();
+            let est: Vec<usize> = misses.iter().map(|(_, cost)| *cost).collect();
             requests += plan_batches(
                 misses.len(),
                 self.cfg.batch_findings,
-                &misses,
-                TOKEN_CEILING,
+                &est,
+                self.backend.token_ceiling(),
             )
             .len();
         }
-        (requests, tokens)
+        Ok((requests, tokens))
     }
 
     /// Judge every finding a registered judge claims. Findings the model
     /// never reaches, for any reason, are left exactly as the engine
     /// reported them.
-    pub async fn run(&self, report: &mut Report, ctx: &RepoContext) -> RunStats {
+    pub async fn run(&self, report: &mut Report, ctx: &RepoContext) -> Result<RunStats, RunError> {
         let mut stats = RunStats::default();
         let Some(client) = self.client.clone() else {
-            return stats;
+            return Ok(stats);
         };
 
         for judge in registry() {
@@ -220,9 +278,26 @@ impl Driver {
                 continue;
             }
 
+            let items: Vec<(String, usize)> = misses
+                .iter()
+                .map(|p| {
+                    let msg = &report.findings[p.index].message;
+                    let name = judges::dead_code::function_name(msg)
+                        .unwrap_or(msg)
+                        .to_string();
+                    (name, p.tokens)
+                })
+                .collect();
+            self.check_fits(&items)?;
+
             // Batch the misses and fire them concurrently.
             let est: Vec<usize> = misses.iter().map(|p| p.tokens).collect();
-            let batches = plan_batches(misses.len(), self.cfg.batch_findings, &est, TOKEN_CEILING);
+            let batches = plan_batches(
+                misses.len(),
+                self.cfg.batch_findings,
+                &est,
+                self.backend.token_ceiling(),
+            );
 
             let sem = Arc::new(tokio::sync::Semaphore::new(self.cfg.concurrency.max(1)));
             let mut tasks = Vec::new();
@@ -327,7 +402,7 @@ impl Driver {
             }
         }
 
-        stats
+        Ok(stats)
     }
 
     fn apply_one(
@@ -463,11 +538,11 @@ mod tests {
         );
         // Five dead_code findings at two per batch is three requests, and
         // the token estimate is the sum of all five slots' costs.
-        let (requests, tokens) = d.plan(&report(5), &ctx());
+        let (requests, tokens) = d.plan(&report(5), &ctx()).unwrap();
         assert_eq!(requests, 3);
         assert!(tokens > 0, "a real request costs real tokens");
         // A report with nothing this judge claims costs nothing.
-        assert_eq!(d.plan(&report(0), &ctx()), (0, 0));
+        assert_eq!(d.plan(&report(0), &ctx()).unwrap(), (0, 0));
     }
 
     #[tokio::test]
@@ -498,7 +573,8 @@ mod tests {
         // Before anything is cached the plan is one request, at a nonzero
         // token cost.
         let (requests, tokens) = Driver::new(None, cache(), JudgeConfig::default(), Backend::jev())
-            .plan(&report(1), &ctx());
+            .plan(&report(1), &ctx())
+            .unwrap();
         assert_eq!(requests, 1);
         assert!(tokens > 0);
 
@@ -511,11 +587,12 @@ mod tests {
             JudgeConfig::default(),
             Backend::jev(),
         );
-        d.run(&mut report(1), &ctx()).await;
+        d.run(&mut report(1), &ctx()).await.unwrap();
 
         assert_eq!(
             Driver::new(None, cache(), JudgeConfig::default(), Backend::jev())
-                .plan(&report(1), &ctx()),
+                .plan(&report(1), &ctx())
+                .unwrap(),
             (0, 0)
         );
     }
@@ -531,7 +608,7 @@ mod tests {
         );
         let mut r = report(3);
         let before = r.clone();
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
         assert_eq!(r, before);
         assert_eq!(stats.judged, 0);
         assert_eq!(stats.requested, 0);
@@ -568,7 +645,7 @@ mod tests {
         );
 
         let mut r = report(1);
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
 
         assert_eq!(stats.judged, 1);
         assert_eq!(stats.requested, 1);
@@ -601,7 +678,7 @@ mod tests {
             Backend::jev(),
         );
         let mut r = report(2);
-        d.run(&mut r, &ctx()).await;
+        d.run(&mut r, &ctx()).await.unwrap();
 
         let sent = server.received_requests().await.unwrap();
         assert_eq!(sent.len(), 1, "two findings fit one batch");
@@ -671,10 +748,10 @@ mod tests {
         };
 
         let mut first = report(1);
-        make().run(&mut first, &ctx()).await;
+        make().run(&mut first, &ctx()).await.unwrap();
 
         let mut second = report(1);
-        let stats = make().run(&mut second, &ctx()).await;
+        let stats = make().run(&mut second, &ctx()).await.unwrap();
 
         assert_eq!(stats.requested, 0);
         assert_eq!(stats.from_cache, 1);
@@ -726,7 +803,7 @@ mod tests {
         };
 
         let mut first = report(1);
-        let s1 = make().run(&mut first, &ctx()).await;
+        let s1 = make().run(&mut first, &ctx()).await.unwrap();
         assert_eq!(s1.requested, 1);
         assert_eq!(s1.judged, 1, "a partial set is still applied");
         // resolver_missed_a_call is the only missing key; decide's
@@ -737,7 +814,7 @@ mod tests {
         assert_eq!(first.findings[0].extra["judgment"]["verdict"], "dismiss");
 
         let mut second = report(1);
-        let stats = make().run(&mut second, &ctx()).await;
+        let stats = make().run(&mut second, &ctx()).await.unwrap();
         assert_eq!(stats.from_cache, 0, "a partial set must not be cached");
         assert_eq!(stats.requested, 1, "so the second run asks again");
     }
@@ -792,7 +869,7 @@ mod tests {
 
         let mut r = report(2);
         let before = r.clone();
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
 
         assert_eq!(stats.failed, 1, "exactly one batch failed");
         assert_eq!(stats.judged, 1, "the other still applied");
@@ -844,7 +921,7 @@ mod tests {
         );
 
         let mut r = report(3);
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
 
         assert_eq!(stats.failed, 1, "one batch failed");
         assert_eq!(
@@ -882,7 +959,7 @@ mod tests {
         );
 
         let mut r = report(4);
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
 
         assert_eq!(stats.failed, 4, "four batches, all failing");
         assert_eq!(stats.unjudged, 4);
@@ -921,7 +998,7 @@ mod tests {
             JudgeConfig::default(),
             Backend::jev(),
         );
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
         assert_eq!(stats.missing_sources, 1);
         assert_eq!(stats.prepared, 1);
     }
@@ -953,7 +1030,7 @@ mod tests {
 
         let mut r = report(2);
         let before = r.clone();
-        let stats = d.run(&mut r, &ctx()).await;
+        let stats = d.run(&mut r, &ctx()).await.unwrap();
 
         assert_eq!(stats.failed, 1);
         assert_eq!(stats.judged, 0);
@@ -986,7 +1063,7 @@ mod tests {
             JudgeConfig::default(),
             pinned,
         );
-        d.run(&mut report(1), &ctx()).await;
+        d.run(&mut report(1), &ctx()).await.unwrap();
 
         let sent = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
@@ -1021,10 +1098,73 @@ mod tests {
                 ..Backend::laya()
             },
         );
-        d.run(&mut report(1), &ctx()).await;
+        d.run(&mut report(1), &ctx()).await.unwrap();
 
         let sent = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
         assert!(body.get("model").is_none(), "no model key at all: {body}");
+    }
+
+    /// Review Focus 3: a budget too small for one finding must say so by
+    /// name rather than truncate the state or send a request that 422s.
+    #[tokio::test]
+    async fn a_backend_too_small_for_one_finding_is_a_named_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // 512 is Laya's English checkpoint. One dead_code finding needs
+        // roughly 1,200 tokens, so this cannot work and must not pretend to.
+        let small = Backend {
+            state_tokens: 512,
+            ..Backend::laya()
+        };
+        let d = Driver::new(
+            None,
+            Cache::new(dir.path().into(), false),
+            JudgeConfig::default(),
+            small,
+        );
+        let err = d.plan(&report(1), &ctx()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("laya"), "names the backend: {msg}");
+        assert!(msg.contains("512"), "names the budget: {msg}");
+        assert!(
+            msg.contains("fn0"),
+            "names the finding it could not fit: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_budget_is_the_same_named_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let zero = Backend {
+            state_tokens: 0,
+            ..Backend::laya()
+        };
+        let d = Driver::new(
+            None,
+            Cache::new(dir.path().into(), false),
+            JudgeConfig::default(),
+            zero,
+        );
+        assert!(d.plan(&report(1), &ctx()).is_err());
+    }
+
+    #[test]
+    fn the_ceiling_follows_the_backend_not_a_constant() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |b: Backend| {
+            Driver::new(
+                None,
+                Cache::new(dir.path().into(), false),
+                JudgeConfig::default(),
+                b,
+            )
+        };
+        // Laya's 6,144 fits fewer findings per batch than Jev's 24,576.
+        let (laya_reqs, _) = mk(Backend::laya()).plan(&report(20), &ctx()).unwrap();
+        let (jev_reqs, _) = mk(Backend::jev()).plan(&report(20), &ctx()).unwrap();
+        assert!(
+            laya_reqs >= jev_reqs,
+            "a smaller budget cannot need fewer requests: laya {laya_reqs}, jev {jev_reqs}"
+        );
     }
 }
