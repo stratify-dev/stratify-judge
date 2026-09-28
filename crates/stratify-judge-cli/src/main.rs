@@ -81,9 +81,10 @@ struct Args {
     cache_dir: PathBuf,
 
     /// Which model endpoint to ask: a built-in preset (jev, laya) or a
-    /// name with a [judge.backends.<name>] table.
-    #[arg(long, default_value = "jev")]
-    backend: String,
+    /// name with a [judge.backends.<name>] table. Defaults to the
+    /// [judge] backend key in config, then jev, when not passed.
+    #[arg(long)]
+    backend: Option<String>,
 
     /// Model id to send. Jev requires one; Laya ignores it.
     #[arg(long)]
@@ -156,12 +157,22 @@ async fn main() -> ExitCode {
     // untracked files into whatever repository is being analysed.
     let cache = Cache::new(args.cache_dir.clone(), !args.no_cache);
 
+    // Resolution order, narrowest wins: the flag, then the [judge] backend
+    // key in config, then jev. The flag has to stay Option<String> with no
+    // clap default, or "typed --backend jev" would be indistinguishable
+    // from "typed nothing" and could never lose to a config key.
+    let backend_name = args
+        .backend
+        .clone()
+        .or_else(|| cfg.backend.clone())
+        .unwrap_or_else(|| "jev".to_string());
+
     // An unresolvable backend is a configuration error discovered before
     // anything is read from any model, unlike every other failure below,
     // which passes the report through and lets --fail-on decide. So this
     // one exits loudly instead of passing through.
     let backend = match resolve_backend(
-        &args.backend,
+        &backend_name,
         &cfg,
         args.base_url.as_deref(),
         args.model.as_deref(),

@@ -76,6 +76,11 @@ pub struct JudgeConfig {
     /// `[judge.backends.<name>]` tables, overlaying the built-in presets.
     #[serde(default)]
     pub backends: std::collections::BTreeMap<String, crate::backend::BackendOverride>,
+    /// `[judge] backend = "<name>"`, selecting which backend a run
+    /// resolves against when `--backend` is not passed on the CLI.
+    /// Resolution order is flag, then this key, then the `jev` default.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 impl Default for JudgeConfig {
@@ -86,6 +91,7 @@ impl Default for JudgeConfig {
             batch_files: d_batch_files(),
             thresholds: Thresholds::default(),
             backends: std::collections::BTreeMap::new(),
+            backend: None,
         }
     }
 }
@@ -179,5 +185,28 @@ dismiss_at = 0.9
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("stratify.toml"), "[judge\nbroken").unwrap();
         assert_eq!(JudgeConfig::load(dir.path()).concurrency, 8);
+    }
+
+    /// I3: `[judge] backend = "laya"` was silently dropped because
+    /// `JudgeConfig` had no field for it, so a run went to the hosted
+    /// default with no warning.
+    #[test]
+    fn the_backend_key_selects_a_backend_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("stratify.toml"),
+            "[judge]\nbackend = \"laya\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            JudgeConfig::load(dir.path()).backend.as_deref(),
+            Some("laya")
+        );
+    }
+
+    #[test]
+    fn the_backend_key_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(JudgeConfig::load(dir.path()).backend, None);
     }
 }

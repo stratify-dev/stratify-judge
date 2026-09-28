@@ -93,6 +93,18 @@ resolved before spending anything.
 A name that is not a preset needs a `[judge.backends.<name>]` table in
 `stratify.toml` or `stratify-judge.toml`, setting at least `url`.
 
+`[judge] backend = "<name>"` in the same config picks the default backend
+for runs that pass no `--backend` flag. Resolution order, narrowest wins:
+the `--backend` flag, then this config key, then `jev`.
+
+```toml
+[judge]
+backend = "laya"
+
+[judge.backends.laya]
+url = "http://127.0.0.1:8000"
+```
+
 To run against a local Laya:
 
 ```sh

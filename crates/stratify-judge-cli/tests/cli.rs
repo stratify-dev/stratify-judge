@@ -383,3 +383,52 @@ fn a_missing_key_names_the_backends_own_env_var() {
         .success()
         .stderr(predicates::str::contains("TYPESAFE_API_KEY"));
 }
+
+/// I3: `[judge] backend = "laya"` in config must route --dry-run to that
+/// backend when --backend is not passed on the CLI. Before the fix,
+/// `JudgeConfig` had no field for the key, so it was dropped without a
+/// word and the run went to jev instead.
+#[test]
+fn a_config_backend_key_routes_dry_run_without_a_flag() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("stratify-judge.toml"),
+        "[judge]\nbackend = \"laya\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("LAYA_API_KEY")
+        .args(["--root", root.path().to_str().unwrap(), "--dry-run"])
+        .write_stdin(report_json())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("backend laya"));
+}
+
+/// I3: the flag beats the config key when both name a backend.
+#[test]
+fn the_backend_flag_beats_a_config_key_naming_a_different_backend() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("stratify-judge.toml"),
+        "[judge]\nbackend = \"laya\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stratify-judge")
+        .unwrap()
+        .env_remove("TYPESAFE_API_KEY")
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "--backend",
+            "jev",
+            "--dry-run",
+        ])
+        .write_stdin(report_json())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("backend jev"));
+}
