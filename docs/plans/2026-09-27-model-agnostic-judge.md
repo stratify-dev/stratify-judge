@@ -849,7 +849,133 @@ In `driver.rs`, both call sites pass `&self.backend` instead of `&self.cfg.model
 Run: `cargo test -p stratify-judge-core`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Make the backend the only source of "which model"**
+
+The cache key now reads `self.backend`, but two places still read
+`self.cfg.model`, so `Driver` has two independent sources for one fact. Before
+this task they were the same field and could not disagree. Now they can, and
+the split is invisible to the suite because every test pairs
+`JudgeConfig::default()` (`model: "jev-latest"`) with `Backend::jev()`
+(`model: Some("jev-latest")`), so the two values coincide by construction.
+
+In `driver.rs`, the outgoing request takes the backend's model:
+
+```rust
+                let req = SystemOneRequest {
+                    state: serde_json::Value::Object(state),
+                    // The backend owns which model to ask. Reading cfg here
+                    // while the cache key reads the backend would let a
+                    // request go to one model and its answer be filed under
+                    // another's key, in a cache meant to be committed. It is
+                    // also already Option, so a backend with no model omits
+                    // the field rather than sending a name the endpoint does
+                    // not know.
+                    model: self.backend.model.clone(),
+                    questions: qs,
+                };
+```
+
+And `apply_one`'s fallback label prefers the response, then the backend's
+model, then the backend's name, so a judgment from a model-less backend is
+labelled `laya` rather than an empty string:
+
+```rust
+        if judgment.model.is_empty() {
+            judgment.model = if model.is_empty() {
+                self.backend
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| self.backend.name.clone())
+            } else {
+                model.to_string()
+            };
+        }
+```
+
+Then delete `JudgeConfig`'s `model` field, its `d_model()` default function, and
+its entry in the `Default` impl, in `config.rs`. The knob it provided is
+superseded: `--model` sets it per run, and `[judge.backends.<name>] model` sets
+it per backend. Update `defaults_match_the_spec_when_no_config_exists` to drop
+its `c.model` assertion.
+
+- [ ] **Step 6: Write the test that would have caught this**
+
+Append to `driver.rs`'s tests:
+
+```rust
+    /// The request must name the model the cache key hashes. When these
+    /// disagree, an answer from one model is filed under another's key, and
+    /// the cache is meant to be committed, so the mismatch outlives the run.
+    #[tokio::test]
+    async fn the_request_carries_the_backends_model_not_the_configs() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "jev-1.13.0",
+                "answers": {},
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = Backend {
+            model: Some("jev-preview".into()),
+            ..Backend::jev()
+        };
+        let d = Driver::new(
+            Some(Client::new(server.uri(), Some("k".into()))),
+            Cache::new(dir.path().into(), false),
+            JudgeConfig::default(),
+            pinned,
+        );
+        d.run(&mut report(1), &ctx()).await;
+
+        let sent = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["model"], "jev-preview", "the backend's model, not the config's");
+    }
+
+    /// A backend with no model omits the field entirely. Laya's documented
+    /// request has no `model` key, and sending one names an endpoint it does
+    /// not know.
+    #[tokio::test]
+    async fn a_backend_without_a_model_omits_the_field() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "laya-1",
+                "answers": {},
+                "usage": { "input_tokens": 10, "output_tokens": 0 }
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let d = Driver::new(
+            Some(Client::new(server.uri(), None)),
+            Cache::new(dir.path().into(), false),
+            JudgeConfig::default(),
+            Backend {
+                url: server.uri(),
+                ..Backend::laya()
+            },
+        );
+        d.run(&mut report(1), &ctx()).await;
+
+        let sent = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert!(body.get("model").is_none(), "no model key at all: {body}");
+    }
+```
+
+- [ ] **Step 7: Correct the README**
+
+`README.md`'s Cache section says the key hashes the configured model alias.
+That is no longer true. It hashes the backend name and the backend's model, so
+a Jev answer and a Laya answer never share a key. Say that instead.
+
+- [ ] **Step 8: Commit**
 
 ```bash
 git add -A
